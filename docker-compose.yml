@@ -1,0 +1,12 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PROJECT_ROOT: /workspace/projects
+    volumes:
+      - ./projects:/workspace/projects
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8000:8000"

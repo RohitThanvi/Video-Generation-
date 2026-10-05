@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Video Compiler</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">V</div><div><strong>Video Compiler</strong><span>AI video studio</span></div></div>
+      <button id="newProject" class="new-chat">＋ New video</button>
+      <div class="side-label">Projects</div>
+      <div id="projectList" class="project-list"></div>
+      <div class="sidebar-footer"><span class="status-dot"></span> Local engine ready</div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div><div id="projectTitle" class="top-title">New video</div><div id="projectMeta" class="top-meta">Describe what you want to create</div></div>
+        <div class="top-actions"><button id="validateBtn" class="ghost" disabled>Validate</button><button id="renderBtn" class="primary small" disabled>Render video</button></div>
+      </header>
+
+      <section id="chat" class="chat"></section>
+
+      <section id="videoPanel" class="video-panel hidden">
+        <div class="panel-head"><strong>Rendered video</strong><button id="closeVideo" class="icon-btn">×</button></div>
+        <video id="video" controls playsinline></video>
+        <a id="downloadVideo" class="download" download>Download MP4</a>
+      </section>
+
+      <div class="composer-wrap">
+        <div id="attachments" class="attachments"></div>
+        <div class="composer">
+          <button id="attachBtn" class="icon-btn" title="Attach file">＋</button>
+          <input id="fileInput" type="file" hidden multiple accept="image/*,video/*,audio/*,.ttf,.otf,.woff,.woff2,.glb,.gltf,.obj,.fbx,.json,.csv,.txt" />
+          <textarea id="prompt" rows="1" placeholder="Describe the video you want to create..."></textarea>
+          <button id="sendBtn" class="send" title="Send">➤</button>
+        </div>
+        <div class="composer-hint">The agent creates the storyboard, HTML/CSS/JS, narration and render. Your files stay in the project workspace.</div>
+      </div>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
