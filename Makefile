@@ -6,3 +6,6 @@ run-api:
 
 health:
 	curl http://127.0.0.1:8000/health
+
+test:
+	python -m pytest -q

@@ -1,8 +1,13 @@
 from pathlib import Path
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from .config import PROJECT_ROOT
+
+# Project ids are always uuid4().hex. Anything else (".." etc.) is rejected so a crafted
+# id can never point outside PROJECT_ROOT.
+_PROJECT_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 DIRS = (
     "source",
@@ -22,7 +27,19 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 def project_dir(project_id: str) -> Path:
+    if not isinstance(project_id, str) or not _PROJECT_ID_RE.fullmatch(project_id):
+        raise FileNotFoundError(project_id)
     return PROJECT_ROOT / project_id
+
+def require_project_dir(project_id: str) -> Path:
+    """Like project_dir, but also requires the project to actually exist.
+
+    Write paths must use this so a bogus id can't create stray directories.
+    """
+    root = project_dir(project_id)
+    if not (root / "project.json").is_file():
+        raise FileNotFoundError(project_id)
+    return root
 
 def create_project(prompt: str) -> dict:
     project_id = uuid.uuid4().hex
@@ -68,4 +85,4 @@ def save_project(manifest: dict):
 
 def list_files(project_id: str):
     root = project_dir(project_id)
-    return [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
+    return [p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()]

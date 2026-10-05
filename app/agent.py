@@ -26,6 +26,9 @@ Rules:
 14. Do not assume remote internet assets exist because the renderer has no network.
 15. The project is intended for deterministic browser rendering, not interactive user presentation.
 16. Do not execute arbitrary host commands. Only use the provided tools.
+17. The page is recorded in real time starting at page load, and the video length is the sum of the storyboard scene durations. Your animation timeline must therefore start at load and run for that long (CSS animations or timers). window.__VIDEO_EXPORT__, window.__VIDEO_FPS__ and window.__VIDEO_TOTAL__ are defined before your scripts run.
+18. Audio playing in the page is NOT recorded. To add narration, call generate_narration and set "narration": "<file>.wav" on the scene in the storyboard; the compiler mixes that clip in at the scene's start time. Do not rely on <audio> elements.
+19. fetch() cannot read file:// URLs in Chromium, so inline small data into your JS instead of fetching local data files.
 
 Create polished explainer-style videos. Use actual HTML/CSS/JS rather than placeholder text.
 """
@@ -142,7 +145,14 @@ def _tool_schemas():
         }
     ]
 
-def _call_tool(project_id, name, args):
+def _path_was_supplied_by_user(source_path, supplied_text: str) -> bool:
+    """True if the user's own text (project prompt / instruction) contains this exact path."""
+    p = str(source_path or "").strip()
+    if not p:
+        return False
+    return p in supplied_text or p.replace("\\", "/") in supplied_text.replace("\\", "/")
+
+def _call_tool(project_id, name, args, supplied_text=""):
     if name == "write_storyboard":
         return write_storyboard(project_id, args["storyboard"])
     if name == "write_source":
@@ -150,14 +160,25 @@ def _call_tool(project_id, name, args):
     if name == "save_text_asset":
         return save_text_asset(project_id, args["asset_type"], args["filename"], args["content"])
     if name == "generate_narration":
+        rate = args.get("rate")
+        volume = args.get("volume")
         return generate_narration(
             project_id,
             args["filename"],
             args["text"],
-            int(args.get("rate", 170)),
-            float(args.get("volume", 1.0)),
+            170 if rate is None else int(rate),
+            1.0 if volume is None else float(volume),
         )
     if name == "ingest_host_asset":
+        # The model must not be able to pull arbitrary files off the host (e.g. after a
+        # prompt injection). Only a path the user typed themselves is allowed; uploads
+        # made through the UI/CLI are already in the project.
+        if not _path_was_supplied_by_user(args.get("source_path"), supplied_text):
+            raise PermissionError(
+                "source_path was not supplied by the user. Only use a path exactly as the user "
+                "wrote it in their request, or ask them to attach the file in the UI / "
+                "`cli.py add-asset`."
+            )
         return ingest_host_asset(
             project_id,
             args["asset_type"],
@@ -168,7 +189,7 @@ def _call_tool(project_id, name, args):
         return validate(project_id)
     if name == "render_video":
         return render(project_id, int(args["width"]), int(args["height"]), int(args["fps"]))
-    raise ValueError(name)
+    raise ValueError(f"Unknown tool: {name}")
 
 def run_agent(project_id: str, instruction: str | None = None):
     if not GROQ_API_KEY:
@@ -192,6 +213,8 @@ def run_agent(project_id: str, instruction: str | None = None):
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": json.dumps(user_message, indent=2)},
     ]
+    # Text the user wrote themselves: the only place a host path may come from.
+    supplied_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
 
     for _ in range(30):
         response = client.chat.completions.create(
@@ -223,8 +246,13 @@ def run_agent(project_id: str, instruction: str | None = None):
 
         for tc in msg.tool_calls:
             try:
-                args = json.loads(tc.function.arguments)
-                result = _call_tool(project_id, tc.function.name, args)
+                # Tools without parameters (validate_project) are often called with an
+                # empty string instead of "{}".
+                raw_args = tc.function.arguments
+                args = json.loads(raw_args) if raw_args and raw_args.strip() else {}
+                if not isinstance(args, dict):
+                    raise ValueError("Tool arguments must be a JSON object.")
+                result = _call_tool(project_id, tc.function.name, args, supplied_text)
                 tool_output = {"ok": True, "result": result}
             except Exception as exc:
                 tool_output = {"ok": False, "error": str(exc)}

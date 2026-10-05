@@ -1,4 +1,5 @@
 from pathlib import Path
+import tempfile
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
@@ -6,13 +7,23 @@ from fastapi.staticfiles import StaticFiles
 
 from .models import ProjectCreate, AgentRequest, RenderRequest
 from .project import create_project, load_project, project_dir
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT, MAX_FILE_BYTES
 from .agent import run_agent
-from .tools import validate, render, ingest_host_asset
+from .tools import validate, render, ingest_host_asset, ValidationFailed, CATEGORY_EXTENSIONS
 
 app = FastAPI(title="AI Video Compiler", version="0.2.0")
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+def _http_error(exc: Exception) -> HTTPException:
+    """Map domain errors to meaningful status codes instead of a blanket 500."""
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=404, detail="Project not found.")
+    if isinstance(exc, ValidationFailed):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail=str(exc))
 
 @app.get("/")
 def frontend():
@@ -47,32 +58,42 @@ def get_project(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found.")
 
 @app.post("/projects/{project_id}/agent")
-def agent(project_id: str, req: AgentRequest):
+def agent(project_id: str, req: AgentRequest | None = None):
     try:
-        return run_agent(project_id, req.instruction)
+        return run_agent(project_id, req.instruction if req else None)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise _http_error(exc)
 
 @app.post("/projects/{project_id}/validate")
 def validate_endpoint(project_id: str):
     try:
         return validate(project_id)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise _http_error(exc)
 
 @app.post("/projects/{project_id}/render")
-def render_endpoint(project_id: str, req: RenderRequest):
+def render_endpoint(project_id: str, req: RenderRequest | None = None):
+    req = req or RenderRequest()
     try:
         return render(project_id, req.width, req.height, req.fps)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise _http_error(exc)
 
 @app.get("/projects/{project_id}/video")
 def project_video(project_id: str):
-    path = project_dir(project_id) / "renders" / "final" / "final.mp4"
+    try:
+        path = project_dir(project_id) / "renders" / "final" / "final.mp4"
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Project not found.")
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Rendered video not found.")
-    return FileResponse(path, media_type="video/mp4", filename="final.mp4")
+    # no-store: a re-render replaces the file at the same URL.
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename="final.mp4",
+        headers={"Cache-Control": "no-store"},
+    )
 
 @app.post("/projects/{project_id}/assets")
 async def upload_asset(
@@ -80,26 +101,33 @@ async def upload_asset(
     asset_type: str = Form(...),
     file: UploadFile = File(...),
 ):
+    # Check the project first: otherwise a bogus id would create stray directories.
+    try:
+        load_project(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
     suffix = Path(file.filename or "").suffix.lower()
-    allowed = {
-        "image": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"},
-        "video": {".mp4", ".webm", ".mov"},
-        "audio": {".wav", ".mp3", ".ogg", ".m4a"},
-        "font": {".ttf", ".otf", ".woff", ".woff2"},
-        "model3d": {".glb", ".gltf", ".obj", ".fbx"},
-        "data": {".json", ".csv", ".txt"},
-    }
-    if asset_type not in allowed or suffix not in allowed[asset_type]:
+    if asset_type not in CATEGORY_EXTENSIONS or suffix not in CATEGORY_EXTENSIONS[asset_type]:
         raise HTTPException(status_code=400, detail="Unsupported asset type or extension.")
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        temp_path = Path(tmp.name)
-        total = 0
-        while chunk := await file.read(1024 * 1024):
-            total += len(chunk)
-            tmp.write(chunk)
+    temp_path = None
     try:
-        return ingest_host_asset(project_id, asset_type, str(temp_path), file.filename)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = Path(tmp.name)
+            total = 0
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {MAX_FILE_BYTES // (1024 * 1024)} MB limit.",
+                    )
+                tmp.write(chunk)
+        try:
+            return ingest_host_asset(project_id, asset_type, str(temp_path), file.filename)
+        except Exception as exc:
+            raise _http_error(exc)
     finally:
-        temp_path.unlink(missing_ok=True)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)

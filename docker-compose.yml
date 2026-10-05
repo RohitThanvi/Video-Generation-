@@ -5,8 +5,15 @@ services:
       dockerfile: Dockerfile
     environment:
       PROJECT_ROOT: /workspace/projects
+      # The Docker daemon runs on the host, so sandbox bind mounts must use the HOST path
+      # of ./projects, not /workspace/projects. Set it in .env (absolute path).
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:?Set HOST_PROJECT_ROOT in .env to the absolute host path of ./projects}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
     volumes:
       - ./projects:/workspace/projects
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
-      - "8000:8000"
+      # Loopback only: this container can start containers on the host (Docker socket),
+      # so it must not be reachable from the network.
+      - "127.0.0.1:8000:8000"

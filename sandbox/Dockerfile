@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
     espeak-ng \
-    libespeak1 \
+    libespeak-ng1 \
     fonts-dejavu \
     fonts-liberation \
     fonts-noto \
@@ -22,6 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
     playwright \
     pyttsx3
+
+# Chromium comes from apt (render.py passes executable_path), but Playwright's video
+# recording (record_video_dir) needs its own bundled ffmpeg build. Without this step every
+# render fails with "Executable doesn't exist at /ms-playwright/ffmpeg-...".
+RUN playwright install ffmpeg
 
 COPY renderer /opt/renderer
 RUN chmod +x /opt/renderer/*.py
