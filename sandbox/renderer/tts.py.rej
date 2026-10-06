@@ -1,0 +1,11 @@
+diff a/sandbox/renderer/tts.py b/sandbox/renderer/tts.py	(rejected hunks)
+@@ -20,7 +20,8 @@ def synthesize(text: str, output: Path, rate: int = 170, volume: float = 1.0):
+         "-s", str(int(rate)),                 # words per minute
+         "-a", str(int(round(volume * 200))),  # amplitude 0-200
+         "-w", str(output),                    # write WAV to file
+-        "-f", "-",                            # read text from stdin (no argv length limits)
++        "--stdin",                            # read text from stdin (no argv length limits);
++                                              # note: "-f -" does NOT work, espeak-ng stat()s a file named "-"
+     ]
+     try:
+         proc = subprocess.run(cmd, input=text, capture_output=True, text=True, timeout=120)

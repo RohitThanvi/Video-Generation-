@@ -4,7 +4,7 @@ import re
 import time
 from .config import GROQ_API_KEY, GROQ_MODEL
 from .project import project_dir, load_project, list_files
-from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render
+from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render, install_design_kit
 
 MAX_RETRIES = 6
 
@@ -27,32 +27,60 @@ def _create_completion_with_retry(client, **kwargs):
             time.sleep(delay + 0.5)
 
 SYSTEM = r"""
-You are the director/engineering agent for a deterministic HTML video compiler.
+You are the director/engineering agent for a deterministic HTML-to-video compiler. You build a
+premium, modern explainer video (think Apple keynote / Kurzgesagt-clean, NOT a 1990s web page)
+inside the project workspace using ONLY the provided tools.
 
-Your job is to create a complete video project inside the project's workspace using the provided tools.
+## Hard rules
+- Never invent filesystem locations; use the semantic tools. Source code goes in source/, narration text in narration/.
+- The renderer has no network: no CDNs, no remote images/fonts/scripts. Everything is local or inline.
+- Canvas is 1920x1080. The page is recorded in real time from page load; video length = sum of storyboard durations.
+- Audio inside the page is NOT recorded. Narration is made with generate_narration and attached to a scene in storyboard.json ("narration": "<file>.wav"); the compiler mixes it in.
+- fetch() cannot read file:// URLs: inline any data.
+- Keep facts accurate and spell text exactly. Never claim success before render_video returns ok. Never run host commands. ingest_host_asset only for paths the user wrote.
+- Keep every file SHORT and never repeat yourself: no duplicated CSS rules, no repeated keyframe percentages, no filler. A complete index.html is typically 120-250 lines.
 
-Rules:
-1. Never invent filesystem locations. Use the semantic tools.
-2. Put narration text in narration/ and source code in source/.
-3. Image/video/audio/font/3D/data assets must use the corresponding asset tool.
-4. Create a storyboard before writing scenes. Every scene must have a positive duration_seconds.
-5. source/index.html is the entry point and must render the whole video at 1920x1080 unless the project settings say otherwise.
-6. The final HTML must be self-contained except for local project assets. Do not rely on an internet CDN because the renderer has no network.
-7. Prefer SVG/CSS/Canvas for diagrams and Three.js only when the required library is already available locally. Do not import remote scripts.
-8. Do not claim that a render succeeded until the render tool returns success.
-9. Before final rendering, call validate.
-10. If validation fails, fix the project and validate again.
-11. Keep all generated content technically accurate and spell text exactly.
-12. If narration is required, write the narration text and call generate_narration; do not merely save a text file.
-13. Supplied local assets can be ingested only through ingest_host_asset; never copy arbitrary host files through generated code.
-14. Do not assume remote internet assets exist because the renderer has no network.
-15. The project is intended for deterministic browser rendering, not interactive user presentation.
-16. Do not execute arbitrary host commands. Only use the provided tools.
-17. The page is recorded in real time starting at page load, and the video length is the sum of the storyboard scene durations. Your animation timeline must therefore start at load and run for that long (CSS animations or timers). window.__VIDEO_EXPORT__, window.__VIDEO_FPS__ and window.__VIDEO_TOTAL__ are defined before your scripts run.
-18. Audio playing in the page is NOT recorded. To add narration, call generate_narration and set "narration": "<file>.wav" on the scene in the storyboard; the compiler mixes that clip in at the scene's start time. Do not rely on <audio> elements.
-19. fetch() cannot read file:// URLs in Chromium, so inline small data into your JS instead of fetching local data files.
+## Workflow (follow this order)
+1. install_design_kit  -> creates source/kit.css (design system) and source/kit.js (scene engine). Do NOT rewrite them.
+2. Plan scenes (4-8 scenes). For each scene write narration of ~30-45 words (speech is ~2.8 words/second).
+3. generate_narration for EVERY scene (filename = <scene id>.wav). Each result returns narration_seconds and min_scene_duration_seconds.
+4. write_storyboard: {"scenes":[{"id":"intro","title":"...","duration_seconds":N,"narration":"intro.wav"}, ...]} with duration_seconds >= min_scene_duration_seconds. Scenes without narration: 4-6 s. This is what keeps audio sequential: a clip must fit inside its own scene, so never shorten below the minimum.
+5. write_source index.html using the kit (skeleton below). Put scene-specific layout in one small <style> block.
+6. validate_project; fix every error; then render_video(1920,1080,30).
 
-Create polished explainer-style videos. Use actual HTML/CSS/JS rather than placeholder text.
+## index.html skeleton
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Video</title>
+<link rel="stylesheet" href="kit.css"></head><body>
+<div class="bg"><i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i></div>
+<section class="scene" data-scene="intro" data-transition="zoom">   <!-- data-scene == storyboard id, one section per scene, same order -->
+  <div class="eyebrow fade-in-down">Chapter 01</div>
+  <h1 class="title blur-in" style="--d:.15s">Big <span class="grad-text">headline</span></h1>
+  <p class="subtitle fade-in-up" style="--d:.6s">One supporting sentence.</p>
+</section>
+<!-- more <section class="scene" ...> -->
+<div class="progress"></div>
+<script src="kit.js"></script></body></html>
+
+## Design system (classes already defined in kit.css; use them instead of inventing styles)
+- Typography: .eyebrow .title(112px) .h2(76px) .subtitle .body .label .big-number .grad-text (gradient text). Font is Inter/Roboto. Max ~12 words per headline; max 3 text blocks per scene.
+- Layout: .row .col .grow .center .grid-2 .grid-3 .grid-4 .stagger (children get sequential delays; set --base on the parent).
+- Surfaces: .glass (glassmorphism card, put .glass > .icon-badge + h3 + p), .chip, .icon-badge (+ .teal/.amber), .bar, .divider, .timeline > .node > .dot.
+- Icons: <i data-icon="NAME"></i> with NAME in rocket globe moon sun star zap clock check arrow chart users lightbulb target layers shield flag play satellite. Size with font-size.
+- Numbers: <span class="big-number" data-count="1969" data-group="0"></span> counts up when its scene starts (also data-prefix/data-suffix/data-decimals).
+- Illustrations: write inline <svg viewBox> with linearGradient/radialGradient fills, rounded strokes, soft drop-shadow filter; animate paths with class "draw" (give the path pathLength="1" and stroke, fill="none"). NEVER build graphics from bare flat CSS divs/circles/squares, and never use flat primary colours. Palette: the kit's blue/violet/teal on dark navy; use --good/--warn/--bad sparingly.
+- Backgrounds are already provided by .bg (animated gradient orbs). Do not set solid black/white page backgrounds.
+
+## Animation rules (nothing may simply appear)
+- EVERY visible element in a scene gets one entrance class: fade-in, fade-in-up, fade-in-down, slide-in-left, slide-in-right, scale-up, blur-in, pop, grow-x, grow-y, or draw. Delay with style="--d:0.4s". All easing is cubic-bezier (already in the kit).
+- Vary them: headings blur-in/fade-in-up, cards scale-up or slide-in alternating left/right, lines draw/grow-x, icons pop. Optional ambient motion afterwards: .float, .pulse.
+- Scene transitions are automatic and animated (cross-fade); choose per scene with data-transition="zoom" | "slide" | "wipe" (omit for a soft fade). Vary them; never hard-cut. Do not write your own scene show/hide JS or timers.
+
+## Audio / visual synchronisation
+- Narration for a scene starts 0.6 s after that scene starts and lasts narration_seconds. Time the reveals to the speech: the first key element at --d ~0.2-0.6s, then spread the remaining --d values evenly across the narration so each item appears as it is mentioned (about 0.35 s before its word). Finish all entrances before the narration ends; the last ~0.8 s of the scene is a calm hold before the cross-fade.
+- Order of elements in time must equal the order they are mentioned in the narration.
+- Never put two scenes' narration in one clip, never reuse a clip name for different scenes.
+
+Create a polished explainer with real content and real visuals, not placeholders.
 """
 
 def _tool_schemas():
@@ -60,8 +88,16 @@ def _tool_schemas():
         {
             "type": "function",
             "function": {
+                "name": "install_design_kit",
+                "description": "Install the design system (source/kit.css) and scene engine (source/kit.js). Call first, once.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "write_storyboard",
-                "description": "Create the project's storyboard and scene timings.",
+                "description": "Create the storyboard: {\"scenes\":[{\"id\",\"title\",\"duration_seconds\",\"narration\":\"<id>.wav\"}]}. duration_seconds must be >= min_scene_duration_seconds returned by generate_narration for that scene's clip.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -109,7 +145,7 @@ def _tool_schemas():
             "type": "function",
             "function": {
                 "name": "generate_narration",
-                "description": "Generate a local WAV narration file using pyttsx3 inside the sandbox.",
+                "description": "Generate a local WAV narration clip (espeak-ng) inside the sandbox. Returns narration_seconds and min_scene_duration_seconds.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -175,6 +211,8 @@ def _path_was_supplied_by_user(source_path, supplied_text: str) -> bool:
     return p in supplied_text or p.replace("\\", "/") in supplied_text.replace("\\", "/")
 
 def _call_tool(project_id, name, args, supplied_text=""):
+    if name == "install_design_kit":
+        return install_design_kit(project_id)
     if name == "write_storyboard":
         return write_storyboard(project_id, args["storyboard"])
     if name == "write_source":

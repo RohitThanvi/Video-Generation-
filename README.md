@@ -251,3 +251,23 @@ The tests do not need Docker or a Groq key. The renderer's ffmpeg/audio tests ar
 ## After updating
 
 Rebuild the sandbox image whenever `sandbox/` changes (`make build-sandbox`); the host API calls scripts inside that image.
+
+## Visual design kit and audio sync
+
+The agent no longer hand-writes CSS. `install_design_kit` copies `app/kit/kit.css` (design system:
+gradient backgrounds, glassmorphism cards, Inter/Roboto typography, SVG icon set, `fade-in-up` /
+`slide-in-*` / `scale-up` / `blur-in` / `draw` entrance animations with `cubic-bezier` easing) and
+`app/kit/kit.js` (scene engine: animated cross-fade/slide/zoom/wipe transitions, count-up numbers,
+progress bar) into `source/`. See `examples/isro-journey/` for a complete project.
+
+Audio is sequential by construction:
+
+1. `generate_narration` returns `narration_seconds` and `min_scene_duration_seconds`.
+2. The storyboard scene that plays a clip must be at least that long (`validate_project` enforces it).
+3. The renderer starts each clip 0.6 s after its scene starts and refuses to render if clips would
+   overlap or run past the end (`plan_audio`).
+4. `render.py` injects the storyboard's scene ids/durations into the page (`window.__VIDEO_SCENES__`),
+   so the HTML timeline cannot disagree with the storyboard.
+
+Rebuild the sandbox image after pulling (`docker build -t ai-video-sandbox sandbox`): it now installs
+`fonts-inter` and `fonts-roboto`.

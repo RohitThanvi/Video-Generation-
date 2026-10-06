@@ -1,0 +1,81 @@
+diff a/tests/test_renderer.py b/tests/test_renderer.py	(rejected hunks)
+@@ -214,48 +245,54 @@ def test_tts_accepts_text_file_or_text_but_not_both_or_neither():
+         tts.parse_args(["--text", "a", "--text-file", "b", "--output", "/o.wav"])
+ 
+ 
+-class _StubEngine:
+-    def __init__(self, writes):
+-        self.writes = writes
+-        self.path = None
+-        self.props = {}
+-
+-    def setProperty(self, key, value):
+-        self.props[key] = value
+-
+-    def save_to_file(self, text, path):
+-        self.path = path
++def _stub_espeak(monkeypatch, writes, returncode=0, stderr=""):
++    """Replace subprocess.run so no real espeak-ng is needed; records the call."""
++    calls = {}
+ 
+-    def runAndWait(self):
+-        if self.writes:
+-            Path(self.path).write_bytes(b"RIFFdata")
++    def fake_run(cmd, input=None, **kwargs):
++        calls["cmd"], calls["input"] = cmd, input
++        if writes:
++            Path(cmd[cmd.index("-w") + 1]).write_bytes(b"RIFFdata")
++        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr=stderr)
+ 
+-
+-def _stub_pyttsx3(monkeypatch, writes):
+-    engine = _StubEngine(writes)
+-    module = type(sys)("pyttsx3")
+-    module.init = lambda: engine
+-    monkeypatch.setitem(sys.modules, "pyttsx3", module)
+-    return engine
++    monkeypatch.setattr(tts.subprocess, "run", fake_run)
++    return calls
+ 
+ 
+ def test_tts_writes_the_file_and_clamps_volume(tmp_path, monkeypatch):
+-    engine = _stub_pyttsx3(monkeypatch, writes=True)
++    calls = _stub_espeak(monkeypatch, writes=True)
+     out = tmp_path / "n" / "a.wav"
+     tts.synthesize("hello", out, rate=150, volume=7.0)
+     assert out.read_bytes() == b"RIFFdata"
+-    assert engine.props == {"rate": 150, "volume": 1.0}
++    cmd = calls["cmd"]
++    assert cmd[cmd.index("-s") + 1] == "150"
++    assert cmd[cmd.index("-a") + 1] == "200"  # volume clamped to 1.0 -> amplitude 200
++    assert calls["input"] == "hello"
++
++
++def test_tts_reads_stdin_not_a_file_named_dash(tmp_path, monkeypatch):
++    # Regression: espeak-ng treats "-f -" as a file called "-" ("Failed to stat() file '-'").
++    calls = _stub_espeak(monkeypatch, writes=True)
++    tts.synthesize("hello", tmp_path / "a.wav")
++    assert "--stdin" in calls["cmd"]
++    assert "-f" not in calls["cmd"]
+ 
+ 
+ def test_tts_does_not_mistake_a_stale_file_for_success(tmp_path, monkeypatch):
+-    _stub_pyttsx3(monkeypatch, writes=False)
++    _stub_espeak(monkeypatch, writes=False)
+     out = tmp_path / "a.wav"
+     out.write_bytes(b"old")
+     with pytest.raises(RuntimeError):
+         tts.synthesize("hello", out)
+ 
+ 
++def test_tts_surfaces_espeak_errors(tmp_path, monkeypatch):
++    _stub_espeak(monkeypatch, writes=False, returncode=1, stderr="boom")
++    with pytest.raises(RuntimeError, match="boom"):
++        tts.synthesize("hello", tmp_path / "a.wav")
++
++
+ def test_tts_rejects_empty_text(tmp_path, monkeypatch):
+-    _stub_pyttsx3(monkeypatch, writes=True)
++    _stub_espeak(monkeypatch, writes=True)
+     with pytest.raises(RuntimeError):
+         tts.synthesize("  \n ", tmp_path / "a.wav")

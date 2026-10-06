@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>ISRO Journey</title>
+<link rel="stylesheet" href="kit.css">
+<style>
+  #origin .orbit{position:relative;width:560px;height:560px;flex:none}
+  #origin .orbit svg{position:absolute;inset:0;width:100%;height:100%}
+  #origin .year{position:absolute;inset:0;display:grid;place-items:center;text-align:center}
+  #origin .year .big-number{font-size:112px}
+  .spin{animation:spin 24s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #milestones h2{margin-bottom:56px}
+  #milestones .glass .yr{font-size:28px;font-weight:700;letter-spacing:.14em;color:var(--accent)}
+</style></head>
+<body>
+<div class="bg"><i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i></div>
+
+<section class="scene" id="origin" data-scene="origin" data-transition="zoom">
+  <div class="row">
+    <div class="col grow">
+      <div class="eyebrow fade-in-down" style="--d:.1s">Our story begins</div>
+      <h1 class="title blur-in" style="--d:.25s">India reaches for<br><span class="grad-text">the stars</span></h1>
+      <p class="subtitle fade-in-up" style="--d:2.6s">The Indian Space Research Organisation is founded with one goal: space technology for the nation.</p>
+      <div class="row stagger" style="--base:5s;gap:20px;margin-top:16px">
+        <span class="chip pop"><i data-icon="rocket"></i>Launch vehicles</span>
+        <span class="chip pop"><i data-icon="satellite"></i>Satellites</span>
+        <span class="chip pop"><i data-icon="globe"></i>Service to society</span>
+      </div>
+    </div>
+    <div class="orbit scale-up" style="--d:.5s">
+      <svg viewBox="0 0 560 560">
+        <defs>
+          <radialGradient id="core" cx="35%" cy="30%" r="80%"><stop offset="0" stop-color="#9cc4ff"/><stop offset=".55" stop-color="#4f7cff"/><stop offset="1" stop-color="#1b2a6b"/></radialGradient>
+          <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6ea8ff"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="14"/></filter>
+        </defs>
+        <circle cx="280" cy="280" r="190" fill="#4f7cff" opacity=".45" filter="url(#glow)"/>
+        <circle cx="280" cy="280" r="170" fill="url(#core)"/>
+        <circle cx="280" cy="280" r="170" fill="none" stroke="rgba(255,255,255,.28)" stroke-width="2"/>
+        <circle class="draw" style="--d:.8s" pathLength="1" cx="280" cy="280" r="235" fill="none" stroke="url(#ring)" stroke-width="3" stroke-linecap="round"/>
+        <circle class="draw" style="--d:1.2s" pathLength="1" cx="280" cy="280" r="268" fill="none" stroke="rgba(255,255,255,.22)" stroke-width="2" />
+        <g class="spin"><g class="pop" style="--d:1.6s"><circle cx="280" cy="45" r="16" fill="#2dd4bf"/><circle cx="280" cy="45" r="30" fill="#2dd4bf" opacity=".25"/></g></g>
+      </svg>
+      <div class="year"><div><div class="label fade-in" style="--d:1.2s">Established</div>
+        <div class="big-number" data-count="1969" data-group="0" style="--d:1.3s">1969</div></div></div>
+    </div>
+  </div>
+</section>
+
+<section class="scene" id="milestones" data-scene="milestones" data-transition="slide">
+  <div class="eyebrow fade-in-down" style="--d:.1s">Milestones</div>
+  <h2 class="h2 fade-in-up" style="--d:.25s">Three giant <span class="grad-text">leaps</span></h2>
+  <div class="grid-3">
+    <div class="glass slide-in-left" style="--d:1.0s"><div class="icon-badge"><i data-icon="satellite"></i></div>
+      <div class="yr" style="margin-top:28px">1975</div><h3 style="margin-top:6px">Aryabhata</h3><p>India's first satellite reaches orbit.</p></div>
+    <div class="glass fade-in-up" style="--d:4.4s"><div class="icon-badge teal"><i data-icon="moon"></i></div>
+      <div class="yr" style="margin-top:28px">2008</div><h3 style="margin-top:6px">Chandrayaan-1</h3><p>Finds evidence of water on the Moon.</p></div>
+    <div class="glass slide-in-right" style="--d:8s"><div class="icon-badge amber"><i data-icon="rocket"></i></div>
+      <div class="yr" style="margin-top:28px">2014</div><h3 style="margin-top:6px">Mangalyaan</h3><p>Reaches Mars on the first attempt.</p></div>
+  </div>
+</section>
+
+<div class="progress"></div>
+<script src="kit.js"></script>
+</body></html>

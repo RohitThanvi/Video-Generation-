@@ -4,7 +4,7 @@ import mimetypes
 import shutil
 from .config import MAX_FILE_BYTES
 from .project import require_project_dir, load_project, save_project
-from .validation import validate_project
+from .validation import validate_project, wav_seconds, min_scene_seconds
 from .docker_runner import run_in_sandbox
 
 CATEGORY_DIRS = {
@@ -29,6 +29,9 @@ CATEGORY_EXTENSIONS = {
 
 # Text saved as a "narration" asset is the script, not audio (audio comes from generate_narration).
 NARRATION_TEXT_EXTENSIONS = {".txt"}
+
+KIT_DIR = Path(__file__).resolve().parent / "kit"
+KIT_FILES = ("kit.css", "kit.js")
 
 class ValidationFailed(ValueError):
     """Raised by render() when the project does not pass validation."""
@@ -59,6 +62,20 @@ def write_source(project_id: str, relative_path: str, content: str):
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return {"path": target.relative_to(root.resolve()).as_posix()}
+
+def install_design_kit(project_id: str):
+    """Copy the design system (kit.css) and scene engine (kit.js) into source/."""
+    root = require_project_dir(project_id)
+    target = root / "source"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in KIT_FILES:
+        shutil.copyfile(KIT_DIR / name, target / name)
+    return {
+        "files": [f"source/{n}" for n in KIT_FILES],
+        "html_head": '<link rel="stylesheet" href="kit.css">',
+        "html_end_of_body": '<script src="kit.js"></script>',
+        "note": "Use the kit classes from the system prompt. Do not re-implement the engine or the CSS.",
+    }
 
 def write_storyboard(project_id: str, storyboard: dict):
     # Some models send the object as a JSON string.
@@ -158,11 +175,18 @@ def generate_narration(project_id: str, filename: str, text: str, rate: int = 17
         n for n in manifest.get("narration", []) if n.get("filename") != filename
     ] + [entry]
     save_project(manifest)
-    return {
+    seconds = wav_seconds(audio_path)
+    info = {
         "path": f"narration/{filename}",
         "text_path": entry["text_file"],
         "stdout": result["stdout"],
     }
+    if seconds is not None:
+        # The storyboard scene that plays this clip must be at least this long, otherwise
+        # the voice runs into the next scene's narration.
+        info["narration_seconds"] = round(seconds, 2)
+        info["min_scene_duration_seconds"] = min_scene_seconds(seconds)
+    return info
 
 def validate(project_id: str):
     return validate_project(project_id)

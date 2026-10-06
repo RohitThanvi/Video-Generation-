@@ -1,5 +1,8 @@
 from pathlib import Path
 import json
+import math
+import re
+import wave
 from .project import require_project_dir
 from .config import MAX_PROJECT_BYTES, MAX_FILE_BYTES
 
@@ -11,6 +14,25 @@ ALLOWED = {
     "models3d": {".glb", ".gltf", ".obj", ".fbx"},
     "data": {".json", ".csv", ".txt"},
 }
+
+# Narration starts this long after its scene starts (see sandbox/renderer/render.py) and the
+# scene needs a short hold after the last word before the cross-fade into the next scene.
+NARRATION_LEAD_SECONDS = 0.6
+NARRATION_TAIL_SECONDS = 0.8
+
+
+def wav_seconds(path: Path) -> float | None:
+    try:
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    except (wave.Error, EOFError, OSError, ZeroDivisionError):
+        return None
+
+
+def min_scene_seconds(narration_seconds: float, offset: float = NARRATION_LEAD_SECONDS) -> float:
+    """Shortest scene (rounded up to 0.5s) that fits its narration with lead-in and hold."""
+    return math.ceil((offset + narration_seconds + NARRATION_TAIL_SECONDS) * 2) / 2
+
 
 SOURCE_ALLOWED = {".html", ".css", ".js", ".mjs", ".json", ".txt"}
 
@@ -62,6 +84,7 @@ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
         else:
             warnings.append("source/index.html does not exist yet.")
 
+    story_scenes: list = []
     storyboard = root / "storyboard.json"
     if not storyboard.exists():
         if require_renderable:
@@ -89,10 +112,27 @@ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
                     if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
                         errors.append(f"Storyboard scene {i} has invalid duration_seconds.")
                     narration = scene.get("narration")
-                    if narration and not (root / "narration" / Path(str(narration)).name).is_file():
-                        errors.append(
-                            f"Storyboard scene {i} references missing narration file: {narration}"
-                        )
+                    if narration:
+                        clip = root / "narration" / Path(str(narration)).name
+                        if not clip.is_file():
+                            errors.append(
+                                f"Storyboard scene {i} references missing narration file: {narration}"
+                            )
+                        elif isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                            seconds = wav_seconds(clip)
+                            offset = scene.get("narration_offset", NARRATION_LEAD_SECONDS)
+                            if seconds is not None and isinstance(offset, (int, float)):
+                                need = min_scene_seconds(seconds, offset)
+                                if duration + 1e-6 < need:
+                                    errors.append(
+                                        f"Scene '{scene.get('id')}': narration {Path(str(narration)).name} is "
+                                        f"{seconds:.1f}s long but the scene is only {duration}s. Set duration_seconds "
+                                        f"to at least {need} so the voice finishes before the transition."
+                                    )
+
+                story_scenes = scenes
+
+    _check_scene_markup(root, story_scenes, errors, warnings)
 
     return {
         "valid": not errors,
@@ -101,3 +141,30 @@ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
         "total_bytes": total,
         "file_count": sum(1 for p in root.rglob("*") if p.is_file()),
     }
+
+
+def _check_scene_markup(root: Path, scenes: list, errors: list, warnings: list) -> None:
+    """Make sure index.html uses the design kit and has one data-scene section per storyboard scene."""
+    index = root / "source" / "index.html"
+    if not index.is_file():
+        return
+    html = index.read_text(encoding="utf-8", errors="replace")
+    if "kit.js" not in html or "kit.css" not in html:
+        warnings.append(
+            "index.html does not load kit.css/kit.js. Call install_design_kit and link both files "
+            "to get the design system, animations and scene transitions."
+        )
+        return
+    story_ids = [str(s.get("id")) for s in scenes if isinstance(s, dict) and s.get("id")]
+    if not story_ids:
+        return
+    html_ids = re.findall(r"""data-scene\s*=\s*["']([^"']+)["']""", html)
+    missing = [i for i in story_ids if i not in html_ids]
+    extra = [i for i in html_ids if i not in story_ids]
+    if missing:
+        errors.append(
+            "index.html has no <section class=\"scene\" data-scene=\"ID\"> for storyboard scene(s): "
+            + ", ".join(missing)
+        )
+    if extra:
+        errors.append("index.html has data-scene ids that are not in the storyboard: " + ", ".join(extra))

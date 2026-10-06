@@ -409,5 +409,73 @@ def test_agent_tool_names_match_dispatcher():
     schema_names = {t["function"]["name"] for t in agent._tool_schemas()}
     assert schema_names == {
         "write_storyboard", "write_source", "save_text_asset", "generate_narration",
-        "ingest_host_asset", "validate_project", "render_video",
+        "ingest_host_asset", "validate_project", "render_video", "install_design_kit",
     }
+
+
+# ------------------------------------------------------------------ design kit / audio sync
+
+def _wav(path, seconds):
+    import wave
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(b"\x00\x00" * int(8000 * seconds))
+
+
+def test_install_design_kit_copies_css_and_engine(project):
+    result = tools.install_design_kit(project)
+    root = project_dir(project) / "source"
+    assert (root / "kit.css").read_text().count(".fade-in-up") > 0
+    assert "__VIDEO_SCENES__" in (root / "kit.js").read_text()
+    assert result["files"] == ["source/kit.css", "source/kit.js"]
+
+
+def test_validation_rejects_narration_longer_than_its_scene(project):
+    root = project_dir(project)
+    _wav(root / "narration" / "s1.wav", 6.0)
+    (root / "storyboard.json").write_text(
+        json.dumps({"scenes": [{"id": "s1", "duration_seconds": 6, "narration": "s1.wav"}]})
+    )
+    result = validation.validate_project(project)
+    assert not result["valid"]
+    assert "at least 7.5" in " ".join(result["errors"])  # 0.6 lead + 6.0 + 0.8 hold -> 7.5
+
+
+def test_validation_accepts_narration_that_fits(project):
+    root = project_dir(project)
+    _wav(root / "narration" / "s1.wav", 6.0)
+    (root / "storyboard.json").write_text(
+        json.dumps({"scenes": [{"id": "s1", "duration_seconds": 7.5, "narration": "s1.wav"}]})
+    )
+    assert validation.validate_project(project)["valid"]
+
+
+def test_validation_checks_scene_ids_in_index_html(project):
+    root = project_dir(project)
+    tools.install_design_kit(project)
+    (root / "storyboard.json").write_text(
+        json.dumps({"scenes": [{"id": "a", "duration_seconds": 3}, {"id": "b", "duration_seconds": 3}]})
+    )
+    html = (
+        '<link rel="stylesheet" href="kit.css"><section class="scene" data-scene="a"></section>'
+        '<section class="scene" data-scene="zzz"></section><script src="kit.js"></script>'
+    )
+    (root / "source" / "index.html").write_text(html)
+    errors = " ".join(validation.validate_project(project)["errors"])
+    assert "b" in errors and "zzz" in errors
+
+
+def test_validation_warns_when_kit_is_not_used(project):
+    root = project_dir(project)
+    (root / "source").mkdir(exist_ok=True)
+    (root / "source" / "index.html").write_text("<html></html>")
+    assert any("kit.css" in w for w in validation.validate_project(project)["warnings"])
+
+
+def test_system_prompt_enforces_the_design_and_sync_rules():
+    text = agent.SYSTEM
+    for needle in ["install_design_kit", "fade-in-up", "cubic-bezier", "data-scene", "min_scene_duration_seconds", "glass", "inline <svg"]:
+        assert needle in text, needle

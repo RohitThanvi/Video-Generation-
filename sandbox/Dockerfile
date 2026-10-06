@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     espeak-ng \
     libespeak-ng1 \
+    fonts-inter \
+    fonts-roboto \
     fonts-dejavu \
     fonts-liberation \
     fonts-noto \

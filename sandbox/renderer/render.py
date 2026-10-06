@@ -8,6 +8,11 @@ from pathlib import Path
 # Extra seconds recorded after the storyboard ends so trimming to the exact length never
 # cuts the last frames short.
 TAIL_SECONDS = 0.5
+# Narration starts this long after its scene starts, so the scene's cross-fade and first
+# entrance animations finish before the voice begins. Keep in sync with app/validation.py.
+NARRATION_LEAD_SECONDS = 0.6
+# Tolerated overlap between consecutive clips / the end of the video (float noise).
+OVERLAP_EPSILON = 0.05
 MAX_BROWSER_MESSAGES = 20
 
 
@@ -38,9 +43,14 @@ def wav_duration(path: Path) -> float:
 def plan_audio(project: Path, scenes):
     """Decide which narration clips go into the video and when they start.
 
-    A scene can set "narration": "<file>.wav" and that clip starts with the scene. If no
-    scene references narration but narration/*.wav exist, the clips play back to back from
-    the start, in file-name order. Returns [(path, start_seconds), ...].
+    A scene can set "narration": "<file>.wav"; that clip starts NARRATION_LEAD_SECONDS
+    (or the scene's own "narration_offset") after the scene starts. If no scene references
+    narration but narration/*.wav exist, the clips play back to back from the start, in
+    file-name order. Returns [(path, start_seconds), ...].
+
+    Clips must never overlap each other or run past the end of the video: that is what made
+    narration play over itself. Instead of mixing a mess, this raises an error that tells
+    the author which scene needs to be longer.
     """
     narration_dir = project / "narration"
     available = {p.name: p for p in sorted(narration_dir.glob("*.wav"))} if narration_dir.is_dir() else {}
@@ -54,14 +64,26 @@ def plan_audio(project: Path, scenes):
             clip = available.get(Path(str(name)).name)
             if clip is None:
                 raise RuntimeError(f"Scene {scene.get('id')} references missing narration file: {name}")
-            tracks.append((clip, start))
+            offset = float(scene.get("narration_offset", NARRATION_LEAD_SECONDS))
+            tracks.append((clip, start + max(0.0, offset), scene.get("id")))
         start += float(scene["duration_seconds"])
+    total = start
     if not referenced:
         t = 0.0
         for clip in available.values():
-            tracks.append((clip, t))
+            tracks.append((clip, t, None))
             t += wav_duration(clip)
-    return tracks
+
+    for i, (clip, begin, scene_id) in enumerate(tracks):
+        end = begin + wav_duration(clip)
+        limit = tracks[i + 1][1] if i + 1 < len(tracks) else total
+        if end > limit + OVERLAP_EPSILON:
+            what = "the next narration clip starts" if i + 1 < len(tracks) else "the video ends"
+            raise RuntimeError(
+                f"Narration {clip.name} (scene {scene_id}) runs until {end:.2f}s but {what} at {limit:.2f}s. "
+                f"Increase that scene's duration_seconds by at least {end - limit + 0.5:.1f}s or shorten the text."
+            )
+    return [(clip, begin) for clip, begin, _ in tracks]
 
 
 def build_ffmpeg_cmd(src: Path, dst: Path, fps: int, total: float, offset: float, tracks):
@@ -154,6 +176,9 @@ def render(project: Path, width: int, height: int, fps: int):
             ],
         )
 
+        scenes_json = json.dumps(
+            [{"id": sc.get("id"), "duration": float(sc["duration_seconds"])} for sc in storyboard["scenes"]]
+        )
         context = browser.new_context(
             viewport={"width": width, "height": height},
             record_video_dir=str(out_dir),
@@ -166,6 +191,9 @@ def render(project: Path, width: int, height: int, fps: int):
                 "window.__VIDEO_EXPORT__ = true;"
                 f"window.__VIDEO_FPS__ = {int(fps)};"
                 f"window.__VIDEO_TOTAL__ = {float(total)};"
+                # Scene ids + durations from storyboard.json: the page's scene engine
+                # (kit.js) reads these, so HTML timing cannot disagree with the storyboard.
+                f"window.__VIDEO_SCENES__ = {scenes_json};"
             )
         )
 

@@ -70,7 +70,8 @@ def test_plan_audio_places_clip_at_its_scene_start(tmp_path):
         {"id": "c", "duration_seconds": 6, "narration": "narration/three.wav"},
     ]
     plan = render.plan_audio(tmp_path, scenes)
-    assert [(p.name, s) for p, s in plan] == [("two.wav", 4.0), ("three.wav", 9.0)]
+    lead = render.NARRATION_LEAD_SECONDS
+    assert [(p.name, s) for p, s in plan] == [("two.wav", 4.0 + lead), ("three.wav", 9.0 + lead)]
 
 
 def test_plan_audio_falls_back_to_back_to_back_clips(tmp_path):
@@ -79,6 +80,36 @@ def test_plan_audio_falls_back_to_back_to_back_clips(tmp_path):
     make_wav(tmp_path / "narration" / "b.wav", seconds=2.0)
     plan = render.plan_audio(tmp_path, [{"id": "s", "duration_seconds": 10}])
     assert [(p.name, round(s, 2)) for p, s in plan] == [("a.wav", 0.0), ("b.wav", 1.0)]
+
+
+def test_plan_audio_rejects_clips_that_would_overlap(tmp_path):
+    (tmp_path / "narration").mkdir()
+    make_wav(tmp_path / "narration" / "long.wav", seconds=3.0)
+    make_wav(tmp_path / "narration" / "next.wav", seconds=0.5)
+    scenes = [
+        {"id": "a", "duration_seconds": 2, "narration": "long.wav"},
+        {"id": "b", "duration_seconds": 4, "narration": "next.wav"},
+    ]
+    with pytest.raises(RuntimeError, match="scene a.*Increase that scene"):
+        render.plan_audio(tmp_path, scenes)
+
+
+def test_plan_audio_rejects_clip_running_past_the_end(tmp_path):
+    (tmp_path / "narration").mkdir()
+    make_wav(tmp_path / "narration" / "long.wav", seconds=3.0)
+    with pytest.raises(RuntimeError, match="video ends"):
+        render.plan_audio(tmp_path, [{"id": "a", "duration_seconds": 3, "narration": "long.wav"}])
+
+
+def test_plan_audio_allows_back_to_back_clips_that_fit(tmp_path):
+    (tmp_path / "narration").mkdir()
+    make_wav(tmp_path / "narration" / "a.wav", seconds=2.0)
+    make_wav(tmp_path / "narration" / "b.wav", seconds=2.0)
+    scenes = [
+        {"id": "a", "duration_seconds": 4, "narration": "a.wav"},
+        {"id": "b", "duration_seconds": 4, "narration": "b.wav"},
+    ]
+    assert [round(st, 2) for _, st in render.plan_audio(tmp_path, scenes)] == [0.6, 4.6]
 
 
 def test_plan_audio_without_any_narration_is_empty(tmp_path):

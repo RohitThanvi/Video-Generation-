@@ -1,0 +1,1304 @@
+diff --git a/README.md b/README.md
+index 61b4c6a..a790b57 100644
+--- a/README.md
++++ b/README.md
+@@ -251,3 +251,23 @@ The tests do not need Docker or a Groq key. The renderer's ffmpeg/audio tests ar
+ ## After updating
+ 
+ Rebuild the sandbox image whenever `sandbox/` changes (`make build-sandbox`); the host API calls scripts inside that image.
++
++## Visual design kit and audio sync
++
++The agent no longer hand-writes CSS. `install_design_kit` copies `app/kit/kit.css` (design system:
++gradient backgrounds, glassmorphism cards, Inter/Roboto typography, SVG icon set, `fade-in-up` /
++`slide-in-*` / `scale-up` / `blur-in` / `draw` entrance animations with `cubic-bezier` easing) and
++`app/kit/kit.js` (scene engine: animated cross-fade/slide/zoom/wipe transitions, count-up numbers,
++progress bar) into `source/`. See `examples/isro-journey/` for a complete project.
++
++Audio is sequential by construction:
++
++1. `generate_narration` returns `narration_seconds` and `min_scene_duration_seconds`.
++2. The storyboard scene that plays a clip must be at least that long (`validate_project` enforces it).
++3. The renderer starts each clip 0.6 s after its scene starts and refuses to render if clips would
++   overlap or run past the end (`plan_audio`).
++4. `render.py` injects the storyboard's scene ids/durations into the page (`window.__VIDEO_SCENES__`),
++   so the HTML timeline cannot disagree with the storyboard.
++
++Rebuild the sandbox image after pulling (`docker build -t ai-video-sandbox sandbox`): it now installs
++`fonts-inter` and `fonts-roboto`.
+diff --git a/app/agent.py b/app/agent.py
+index 8b56893..4cdbb4f 100644
+--- a/app/agent.py
++++ b/app/agent.py
+@@ -4,7 +4,7 @@ import re
+ import time
+ from .config import GROQ_API_KEY, GROQ_MODEL
+ from .project import project_dir, load_project, list_files
+-from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render
++from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render, install_design_kit
+ 
+ MAX_RETRIES = 6
+ 
+@@ -27,41 +27,77 @@ def _create_completion_with_retry(client, **kwargs):
+             time.sleep(delay + 0.5)
+ 
+ SYSTEM = r"""
+-You are the director/engineering agent for a deterministic HTML video compiler.
++You are the director/engineering agent for a deterministic HTML-to-video compiler. You build a
++premium, modern explainer video (think Apple keynote / Kurzgesagt-clean, NOT a 1990s web page)
++inside the project workspace using ONLY the provided tools.
+ 
+-Your job is to create a complete video project inside the project's workspace using the provided tools.
++## Hard rules
++- Never invent filesystem locations; use the semantic tools. Source code goes in source/, narration text in narration/.
++- The renderer has no network: no CDNs, no remote images/fonts/scripts. Everything is local or inline.
++- Canvas is 1920x1080. The page is recorded in real time from page load; video length = sum of storyboard durations.
++- Audio inside the page is NOT recorded. Narration is made with generate_narration and attached to a scene in storyboard.json ("narration": "<file>.wav"); the compiler mixes it in.
++- fetch() cannot read file:// URLs: inline any data.
++- Keep facts accurate and spell text exactly. Never claim success before render_video returns ok. Never run host commands. ingest_host_asset only for paths the user wrote.
++- Keep every file SHORT and never repeat yourself: no duplicated CSS rules, no repeated keyframe percentages, no filler. A complete index.html is typically 120-250 lines.
+ 
+-Rules:
+-1. Never invent filesystem locations. Use the semantic tools.
+-2. Put narration text in narration/ and source code in source/.
+-3. Image/video/audio/font/3D/data assets must use the corresponding asset tool.
+-4. Create a storyboard before writing scenes. Every scene must have a positive duration_seconds.
+-5. source/index.html is the entry point and must render the whole video at 1920x1080 unless the project settings say otherwise.
+-6. The final HTML must be self-contained except for local project assets. Do not rely on an internet CDN because the renderer has no network.
+-7. Prefer SVG/CSS/Canvas for diagrams and Three.js only when the required library is already available locally. Do not import remote scripts.
+-8. Do not claim that a render succeeded until the render tool returns success.
+-9. Before final rendering, call validate.
+-10. If validation fails, fix the project and validate again.
+-11. Keep all generated content technically accurate and spell text exactly.
+-12. If narration is required, write the narration text and call generate_narration; do not merely save a text file.
+-13. Supplied local assets can be ingested only through ingest_host_asset; never copy arbitrary host files through generated code.
+-14. Do not assume remote internet assets exist because the renderer has no network.
+-15. The project is intended for deterministic browser rendering, not interactive user presentation.
+-16. Do not execute arbitrary host commands. Only use the provided tools.
+-17. The page is recorded in real time starting at page load, and the video length is the sum of the storyboard scene durations. Your animation timeline must therefore start at load and run for that long (CSS animations or timers). window.__VIDEO_EXPORT__, window.__VIDEO_FPS__ and window.__VIDEO_TOTAL__ are defined before your scripts run.
+-18. Audio playing in the page is NOT recorded. To add narration, call generate_narration and set "narration": "<file>.wav" on the scene in the storyboard; the compiler mixes that clip in at the scene's start time. Do not rely on <audio> elements.
+-19. fetch() cannot read file:// URLs in Chromium, so inline small data into your JS instead of fetching local data files.
++## Workflow (follow this order)
++1. install_design_kit  -> creates source/kit.css (design system) and source/kit.js (scene engine). Do NOT rewrite them.
++2. Plan scenes (4-8 scenes). For each scene write narration of ~30-45 words (speech is ~2.8 words/second).
++3. generate_narration for EVERY scene (filename = <scene id>.wav). Each result returns narration_seconds and min_scene_duration_seconds.
++4. write_storyboard: {"scenes":[{"id":"intro","title":"...","duration_seconds":N,"narration":"intro.wav"}, ...]} with duration_seconds >= min_scene_duration_seconds. Scenes without narration: 4-6 s. This is what keeps audio sequential: a clip must fit inside its own scene, so never shorten below the minimum.
++5. write_source index.html using the kit (skeleton below). Put scene-specific layout in one small <style> block.
++6. validate_project; fix every error; then render_video(1920,1080,30).
+ 
+-Create polished explainer-style videos. Use actual HTML/CSS/JS rather than placeholder text.
++## index.html skeleton
++<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Video</title>
++<link rel="stylesheet" href="kit.css"></head><body>
++<div class="bg"><i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i></div>
++<section class="scene" data-scene="intro" data-transition="zoom">   <!-- data-scene == storyboard id, one section per scene, same order -->
++  <div class="eyebrow fade-in-down">Chapter 01</div>
++  <h1 class="title blur-in" style="--d:.15s">Big <span class="grad-text">headline</span></h1>
++  <p class="subtitle fade-in-up" style="--d:.6s">One supporting sentence.</p>
++</section>
++<!-- more <section class="scene" ...> -->
++<div class="progress"></div>
++<script src="kit.js"></script></body></html>
++
++## Design system (classes already defined in kit.css; use them instead of inventing styles)
++- Typography: .eyebrow .title(112px) .h2(76px) .subtitle .body .label .big-number .grad-text (gradient text). Font is Inter/Roboto. Max ~12 words per headline; max 3 text blocks per scene.
++- Layout: .row .col .grow .center .grid-2 .grid-3 .grid-4 .stagger (children get sequential delays; set --base on the parent).
++- Surfaces: .glass (glassmorphism card, put .glass > .icon-badge + h3 + p), .chip, .icon-badge (+ .teal/.amber), .bar, .divider, .timeline > .node > .dot.
++- Icons: <i data-icon="NAME"></i> with NAME in rocket globe moon sun star zap clock check arrow chart users lightbulb target layers shield flag play satellite. Size with font-size.
++- Numbers: <span class="big-number" data-count="1969" data-group="0"></span> counts up when its scene starts (also data-prefix/data-suffix/data-decimals).
++- Illustrations: write inline <svg viewBox> with linearGradient/radialGradient fills, rounded strokes, soft drop-shadow filter; animate paths with class "draw" (give the path pathLength="1" and stroke, fill="none"). NEVER build graphics from bare flat CSS divs/circles/squares, and never use flat primary colours. Palette: the kit's blue/violet/teal on dark navy; use --good/--warn/--bad sparingly.
++- Backgrounds are already provided by .bg (animated gradient orbs). Do not set solid black/white page backgrounds.
++
++## Animation rules (nothing may simply appear)
++- EVERY visible element in a scene gets one entrance class: fade-in, fade-in-up, fade-in-down, slide-in-left, slide-in-right, scale-up, blur-in, pop, grow-x, grow-y, or draw. Delay with style="--d:0.4s". All easing is cubic-bezier (already in the kit).
++- Vary them: headings blur-in/fade-in-up, cards scale-up or slide-in alternating left/right, lines draw/grow-x, icons pop. Optional ambient motion afterwards: .float, .pulse.
++- Scene transitions are automatic and animated (cross-fade); choose per scene with data-transition="zoom" | "slide" | "wipe" (omit for a soft fade). Vary them; never hard-cut. Do not write your own scene show/hide JS or timers.
++
++## Audio / visual synchronisation
++- Narration for a scene starts 0.6 s after that scene starts and lasts narration_seconds. Time the reveals to the speech: the first key element at --d ~0.2-0.6s, then spread the remaining --d values evenly across the narration so each item appears as it is mentioned (about 0.35 s before its word). Finish all entrances before the narration ends; the last ~0.8 s of the scene is a calm hold before the cross-fade.
++- Order of elements in time must equal the order they are mentioned in the narration.
++- Never put two scenes' narration in one clip, never reuse a clip name for different scenes.
++
++Create a polished explainer with real content and real visuals, not placeholders.
+ """
+ 
+ def _tool_schemas():
+     return [
++        {
++            "type": "function",
++            "function": {
++                "name": "install_design_kit",
++                "description": "Install the design system (source/kit.css) and scene engine (source/kit.js). Call first, once.",
++                "parameters": {"type": "object", "properties": {}}
++            }
++        },
+         {
+             "type": "function",
+             "function": {
+                 "name": "write_storyboard",
+-                "description": "Create the project's storyboard and scene timings.",
++                "description": "Create the storyboard: {\"scenes\":[{\"id\",\"title\",\"duration_seconds\",\"narration\":\"<id>.wav\"}]}. duration_seconds must be >= min_scene_duration_seconds returned by generate_narration for that scene's clip.",
+                 "parameters": {
+                     "type": "object",
+                     "properties": {
+@@ -109,7 +145,7 @@ def _tool_schemas():
+             "type": "function",
+             "function": {
+                 "name": "generate_narration",
+-                "description": "Generate a local WAV narration file using pyttsx3 inside the sandbox.",
++                "description": "Generate a local WAV narration clip (espeak-ng) inside the sandbox. Returns narration_seconds and min_scene_duration_seconds.",
+                 "parameters": {
+                     "type": "object",
+                     "properties": {
+@@ -175,6 +211,8 @@ def _path_was_supplied_by_user(source_path, supplied_text: str) -> bool:
+     return p in supplied_text or p.replace("\\", "/") in supplied_text.replace("\\", "/")
+ 
+ def _call_tool(project_id, name, args, supplied_text=""):
++    if name == "install_design_kit":
++        return install_design_kit(project_id)
+     if name == "write_storyboard":
+         return write_storyboard(project_id, args["storyboard"])
+     if name == "write_source":
+diff --git a/app/kit/kit.css b/app/kit/kit.css
+new file mode 100644
+index 0000000..b5fe897
+--- /dev/null
++++ b/app/kit/kit.css
+@@ -0,0 +1,137 @@
++/* Design kit for the HTML video compiler. 1920x1080 canvas. Installed as source/kit.css.
++   Everything animates only while its scene has .is-active (the engine in kit.js sets it). */
++:root{
++  --bg-0:#060913; --bg-1:#0b1226; --bg-2:#131c3a;
++  --ink:#f4f7ff; --ink-dim:rgba(226,232,255,.72); --ink-faint:rgba(226,232,255,.45);
++  --accent:#6ea8ff; --accent-2:#a78bfa; --accent-3:#2dd4bf; --warn:#fbbf24; --bad:#fb7185; --good:#34d399;
++  --glass-bg:linear-gradient(145deg,rgba(255,255,255,.12),rgba(255,255,255,.04));
++  --glass-line:rgba(255,255,255,.16);
++  --shadow:0 30px 80px -20px rgba(0,0,0,.65),0 8px 24px -8px rgba(0,0,0,.45);
++  --ease:cubic-bezier(.22,1,.36,1);          /* smooth out-expo-ish */
++  --ease-io:cubic-bezier(.65,0,.35,1);
++  --ease-spring:cubic-bezier(.34,1.56,.64,1);
++  --t:.8s;                                    /* scene transition length (keep == Kit.TRANSITION) */
++  --font:"Inter","Roboto","Helvetica Neue","DejaVu Sans","Noto Sans",sans-serif;
++}
++*{box-sizing:border-box;margin:0;padding:0}
++html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg-0);color:var(--ink);
++  font-family:var(--font);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
++
++/* ---------- animated background ---------- */
++.bg{position:fixed;inset:0;z-index:0;overflow:hidden;
++  background:
++   radial-gradient(1200px 800px at 15% 10%,rgba(110,168,255,.22),transparent 60%),
++   radial-gradient(1000px 700px at 90% 85%,rgba(167,139,250,.24),transparent 60%),
++   radial-gradient(900px 600px at 60% 40%,rgba(45,212,191,.10),transparent 65%),
++   linear-gradient(160deg,var(--bg-2),var(--bg-1) 45%,var(--bg-0))}
++.bg .orb{position:absolute;border-radius:50%;will-change:transform;animation:drift 22s var(--ease-io) infinite alternate}
++.bg .o1{width:1100px;height:1100px;left:-380px;top:-380px;background:radial-gradient(closest-side,rgba(59,130,246,.55),rgba(59,130,246,0))}
++.bg .o2{width:1000px;height:1000px;right:-340px;bottom:-380px;background:radial-gradient(closest-side,rgba(139,92,246,.5),rgba(139,92,246,0));animation-duration:27s}
++.bg .o3{width:760px;height:760px;left:44%;top:22%;background:radial-gradient(closest-side,rgba(20,184,166,.28),rgba(20,184,166,0));animation-duration:31s}
++.bg::after{content:"";position:absolute;inset:0;
++  background-image:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1.2px);background-size:46px 46px;
++  mask-image:radial-gradient(ellipse at center,#000 30%,transparent 75%)}
++@keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(120px,80px,0) scale(1.12)}}
++
++/* ---------- scenes + transitions ---------- */
++.scene{position:absolute;inset:0;z-index:1;display:flex;flex-direction:column;justify-content:center;gap:26px;
++  padding:110px 140px;visibility:hidden;opacity:0}
++.scene.is-active{visibility:visible;opacity:1;animation:scene-in var(--t) var(--ease) both}
++.scene.is-leaving{animation:scene-out var(--t) var(--ease-io) both}
++/* default = crossfade with a tiny scale; override with data-transition="slide|zoom|wipe" */
++@keyframes scene-in{from{opacity:0;transform:scale(1.025)}to{opacity:1;transform:none}}
++@keyframes scene-out{from{opacity:1;transform:none}to{opacity:0;transform:scale(.985)}}
++.scene[data-transition=slide].is-active{animation-name:slide-in}
++.scene[data-transition=slide].is-leaving{animation-name:slide-out}
++@keyframes slide-in{from{opacity:0;transform:translateX(160px)}to{opacity:1;transform:none}}
++@keyframes slide-out{from{opacity:1;transform:none}to{opacity:0;transform:translateX(-160px)}}
++.scene[data-transition=zoom].is-active{animation-name:zoom-in}
++.scene[data-transition=zoom].is-leaving{animation-name:zoom-out}
++@keyframes zoom-in{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:none}}
++@keyframes zoom-out{from{opacity:1;transform:none}to{opacity:0;transform:scale(1.12)}}
++.scene[data-transition=wipe].is-active{animation-name:wipe-in}
++.scene[data-transition=wipe].is-leaving{animation-name:wipe-out}
++@keyframes wipe-in{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}
++@keyframes wipe-out{from{opacity:1}to{opacity:0}}
++
++/* ---------- entrance animations (use on EVERY element; --d sets the delay) ---------- */
++.fade-in,.fade-in-up,.fade-in-down,.slide-in-left,.slide-in-right,.scale-up,.blur-in,.pop,.draw,.grow-x,.grow-y{opacity:0}
++.is-active .fade-in      {animation:a-fade   .9s var(--ease) var(--d,0s) both}
++.is-active .fade-in-up   {animation:a-up     1s  var(--ease) var(--d,0s) both}
++.is-active .fade-in-down {animation:a-down   1s  var(--ease) var(--d,0s) both}
++.is-active .slide-in-left{animation:a-left   1s  var(--ease) var(--d,0s) both}
++.is-active .slide-in-right{animation:a-right 1s  var(--ease) var(--d,0s) both}
++.is-active .scale-up     {animation:a-scale  .9s var(--ease-spring) var(--d,0s) both}
++.is-active .blur-in      {animation:a-blur   1.1s var(--ease) var(--d,0s) both}
++.is-active .pop          {animation:a-pop    .7s var(--ease-spring) var(--d,0s) both}
++.is-active .grow-x       {transform-origin:left center;animation:a-growx 1.2s var(--ease) var(--d,0s) both}
++.is-active .grow-y       {transform-origin:center bottom;animation:a-growy 1.2s var(--ease) var(--d,0s) both}
++.is-active .draw         {opacity:1;stroke-dasharray:1;stroke-dashoffset:1;animation:a-draw 1.6s var(--ease-io) var(--d,0s) forwards}
++@keyframes a-fade{from{opacity:0}to{opacity:1}}
++@keyframes a-up{from{opacity:0;transform:translateY(48px)}to{opacity:1;transform:none}}
++@keyframes a-down{from{opacity:0;transform:translateY(-48px)}to{opacity:1;transform:none}}
++@keyframes a-left{from{opacity:0;transform:translateX(-120px)}to{opacity:1;transform:none}}
++@keyframes a-right{from{opacity:0;transform:translateX(120px)}to{opacity:1;transform:none}}
++@keyframes a-scale{from{opacity:0;transform:scale(.7)}to{opacity:1;transform:none}}
++@keyframes a-blur{from{opacity:0;filter:blur(12px);transform:scale(1.05)}to{opacity:1;filter:none;transform:none}}
++@keyframes a-pop{0%{opacity:0;transform:scale(.4)}100%{opacity:1;transform:none}}
++@keyframes a-growx{from{opacity:1;transform:scaleX(0)}to{opacity:1;transform:scaleX(1)}}
++@keyframes a-growy{from{opacity:1;transform:scaleY(0)}to{opacity:1;transform:scaleY(1)}}
++@keyframes a-draw{to{stroke-dashoffset:0}}   /* SVG path needs pathLength="1" */
++/* children of .stagger animate one after another (set the animation class on each child) */
++.stagger>*:nth-child(1){--d:calc(var(--base,0s) + .00s)} .stagger>*:nth-child(2){--d:calc(var(--base,0s) + .14s)}
++.stagger>*:nth-child(3){--d:calc(var(--base,0s) + .28s)} .stagger>*:nth-child(4){--d:calc(var(--base,0s) + .42s)}
++.stagger>*:nth-child(5){--d:calc(var(--base,0s) + .56s)} .stagger>*:nth-child(6){--d:calc(var(--base,0s) + .70s)}
++.stagger>*:nth-child(7){--d:calc(var(--base,0s) + .84s)} .stagger>*:nth-child(8){--d:calc(var(--base,0s) + .98s)}
++/* continuous ambient motion (after the entrance finishes) */
++.float{animation:float 6s var(--ease-io) infinite alternate}
++.pulse{animation:pulse 2.4s var(--ease-io) infinite}
++@keyframes float{from{translate:0 -10px}to{translate:0 12px}}
++@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(110,168,255,.45)}60%{box-shadow:0 0 0 28px rgba(110,168,255,0)}}
++
++/* ---------- typography ---------- */
++.eyebrow{display:inline-flex;align-items:center;gap:14px;font-size:26px;font-weight:600;letter-spacing:.22em;
++  text-transform:uppercase;color:var(--accent)}
++.eyebrow::before{content:"";width:56px;height:3px;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
++.title{font-size:112px;line-height:1.02;font-weight:800;letter-spacing:-.035em}
++.h2{font-size:76px;line-height:1.06;font-weight:750;letter-spacing:-.028em}
++.subtitle{font-size:38px;line-height:1.4;font-weight:400;color:var(--ink-dim);max-width:1100px}
++.body{font-size:32px;line-height:1.45;color:var(--ink-dim)}
++.grad-text{background:linear-gradient(100deg,#9cc4ff,#c4b5fd 55%,#5eead4);-webkit-background-clip:text;background-clip:text;color:transparent}
++.big-number{font-size:150px;font-weight:800;letter-spacing:-.04em;line-height:1;font-variant-numeric:tabular-nums}
++.label{font-size:26px;font-weight:500;color:var(--ink-faint);letter-spacing:.04em}
++
++/* ---------- layout helpers ---------- */
++.row{display:flex;align-items:center;gap:60px}.col{display:flex;flex-direction:column;gap:28px}
++.grow{flex:1}.center{align-items:center;text-align:center;justify-content:center}
++.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:40px}
++.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:36px}
++.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:30px}
++
++/* ---------- glassmorphism cards ---------- */
++.glass{position:relative;background:var(--glass-bg);border:1px solid var(--glass-line);border-radius:36px;
++  padding:44px;box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.22);
++  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
++.glass h3{font-size:40px;font-weight:700;letter-spacing:-.015em;margin:22px 0 10px}
++.glass p{font-size:28px;line-height:1.45;color:var(--ink-dim)}
++.chip{display:inline-flex;align-items:center;gap:12px;padding:12px 26px;border-radius:999px;font-size:26px;font-weight:600;
++  background:rgba(110,168,255,.14);border:1px solid rgba(110,168,255,.35);color:#cfe0ff}
++.icon-badge{width:104px;height:104px;border-radius:30px;display:grid;place-items:center;color:#fff;
++  background:linear-gradient(145deg,var(--accent),var(--accent-2));box-shadow:0 18px 40px -10px rgba(110,168,255,.55),inset 0 1px 0 rgba(255,255,255,.4)}
++.icon-badge svg{width:56px;height:56px}
++.icon-badge.teal{background:linear-gradient(145deg,#2dd4bf,#3b82f6)}.icon-badge.amber{background:linear-gradient(145deg,#fbbf24,#fb7185)}
++.divider{height:2px;width:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.28),transparent)}
++.bar{height:22px;border-radius:12px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
++.timeline{position:relative;display:flex;justify-content:space-between;align-items:flex-start}
++.timeline::before{content:"";position:absolute;left:0;right:0;top:34px;height:4px;border-radius:4px;background:rgba(255,255,255,.14)}
++.timeline .node{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;max-width:300px}
++.timeline .dot{width:68px;height:68px;border-radius:50%;background:linear-gradient(145deg,var(--accent),var(--accent-2));
++  border:6px solid var(--bg-1);box-shadow:0 0 0 2px var(--accent)}
++
++/* ---------- global progress bar ---------- */
++.progress{position:fixed;left:0;bottom:0;height:6px;width:100%;z-index:5;transform-origin:left;transform:scaleX(0);
++  background:linear-gradient(90deg,var(--accent),var(--accent-2),var(--accent-3))}
++svg{overflow:visible}
++/* so scale/rotate animations on SVG children pivot around their own centre */
++svg [class]{transform-box:fill-box;transform-origin:center}
++svg .spin{transform-box:view-box;transform-origin:50% 50%}
+diff --git a/app/kit/kit.js b/app/kit/kit.js
+new file mode 100644
+index 0000000..8c4cdd2
+--- /dev/null
++++ b/app/kit/kit.js
+@@ -0,0 +1,127 @@
++/* Scene engine for the HTML video compiler. Installed as source/kit.js.
++ * - Scene durations come from the storyboard: render.py injects window.__VIDEO_SCENES__
++ *   ([{id,duration}]) and scenes are matched by <section class="scene" data-scene="ID">.
++ *   (data-duration="N" is only a fallback for opening the page by hand.)
++ * - Time is performance.now() (ms since navigation), the same clock render.py uses to
++ *   align the recording and the narration, so visuals and audio cannot drift apart.
++ * - Scene i is shown from its start; at its end the NEXT scene starts and scene i
++ *   cross-fades out over TRANSITION seconds, so there are never hard cuts.
++ */
++(function () {
++  var TRANSITION = 0.8; // keep equal to --t in kit.css
++
++  var ICONS = {
++    rocket: '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>',
++    globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
++    moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/>',
++    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>',
++    star: '<path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/>',
++    zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
++    clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
++    check: '<path d="M20 6 9 17l-5-5"/>',
++    arrow: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
++    chart: '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
++    users: '<circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/><path d="M21 21v-2a4 4 0 0 0-3-3.87"/>',
++    lightbulb: '<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/>',
++    target: '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
++    layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
++    shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
++    flag: '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22v-7"/>',
++    play: '<polygon points="6 3 20 12 6 21 6 3"/>',
++    satellite: '<g transform="rotate(-45 12 12)"><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><rect x="1.5" y="8" width="6" height="8" rx="1"/><rect x="16.5" y="8" width="6" height="8" rx="1"/><path d="M7.5 12h2M14.5 12h2M12 9.5V6.5"/></g>'
++  };
++
++  function hydrateIcons(root) {
++    root.querySelectorAll('[data-icon]').forEach(function (el) {
++      var body = ICONS[el.getAttribute('data-icon')];
++      if (!body || el.querySelector('svg')) return;
++      el.insertAdjacentHTML('beforeend',
++        '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" ' +
++        'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' + body + '</svg>');
++    });
++  }
++
++  function easeOut(p) { return 1 - Math.pow(1 - p, 4); }
++
++  // <span data-count="1969" data-prefix="" data-suffix="" data-decimals="0" data-group="0">
++  function startCounters(scene, now) {
++    scene.querySelectorAll('[data-count]').forEach(function (el) {
++      var to = parseFloat(el.getAttribute('data-count'));
++      if (isNaN(to)) return;
++      var dec = parseInt(el.getAttribute('data-decimals') || '0', 10);
++      var pre = el.getAttribute('data-prefix') || '', suf = el.getAttribute('data-suffix') || '';
++      var group = el.getAttribute('data-group') !== '0' && Math.abs(to) >= 10000;
++      var delay = parseFloat((getComputedStyle(el).getPropertyValue('--d') || '0').replace('s', '')) || 0;
++      var dur = parseFloat(el.getAttribute('data-count-duration') || '1.8');
++      var t0 = now + delay;
++      function fmt(v) {
++        var s = v.toFixed(dec);
++        return pre + (group ? Number(s).toLocaleString('en-US', {minimumFractionDigits: dec}) : s) + suf;
++      }
++      el.textContent = fmt(0);
++      (function step() {
++        var p = (performance.now() / 1000 - t0) / dur;
++        if (p < 0) { requestAnimationFrame(step); return; }
++        el.textContent = fmt(to * easeOut(Math.min(p, 1)));
++        if (p < 1) requestAnimationFrame(step);
++      })();
++    });
++  }
++
++  function init() {
++    hydrateIcons(document);
++    var scenes = Array.prototype.slice.call(document.querySelectorAll('.scene'));
++    var plan = window.__VIDEO_SCENES__ || [];
++    var byId = {};
++    plan.forEach(function (s) { byId[s.id] = s; });
++
++    var cursor = 0;
++    var timeline = scenes.map(function (el, i) {
++      var p = byId[el.getAttribute('data-scene')] || plan[i];
++      var dur = p ? Number(p.duration) : parseFloat(el.getAttribute('data-duration'));
++      if (!(dur > 0)) {
++        console.error('Scene ' + (el.getAttribute('data-scene') || i) + ' has no duration. ' +
++          'Give it data-scene="<storyboard id>" matching a storyboard scene.');
++        dur = 3;
++      }
++      var entry = {el: el, start: cursor, end: cursor + dur, state: 'idle'};
++      cursor += dur;
++      return entry;
++    });
++    if (window.__VIDEO_TOTAL__ && Math.abs(window.__VIDEO_TOTAL__ - cursor) > 0.05) {
++      console.error('HTML has ' + scenes.length + ' scenes totalling ' + cursor.toFixed(2) +
++        's but the storyboard totals ' + Number(window.__VIDEO_TOTAL__).toFixed(2) + 's.');
++    }
++
++    var bar = document.querySelector('.progress');
++    var last = timeline.length - 1;
++
++    function tick() {
++      var t = performance.now() / 1000;
++      timeline.forEach(function (s, i) {
++        var el = s.el;
++        if (t >= s.start && s.state === 'idle') {
++          s.state = 'active';
++          el.classList.add('is-active');
++          startCounters(el, t);
++        }
++        // The last scene holds its final frame; every other scene fades out at its end.
++        if (i < last && t >= s.end && s.state === 'active') {
++          s.state = 'leaving';
++          el.classList.add('is-leaving');
++        }
++        if (s.state === 'leaving' && t >= s.end + TRANSITION) {
++          s.state = 'done';
++          el.classList.remove('is-active', 'is-leaving');
++        }
++      });
++      if (bar) bar.style.transform = 'scaleX(' + Math.min(1, t / (cursor || 1)) + ')';
++      requestAnimationFrame(tick);
++    }
++    requestAnimationFrame(tick);
++  }
++
++  window.Kit = {TRANSITION: TRANSITION, icons: ICONS};
++  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
++  else init();
++})();
+diff --git a/app/tools.py b/app/tools.py
+index 292ef46..1cfe145 100644
+--- a/app/tools.py
++++ b/app/tools.py
+@@ -4,7 +4,7 @@ import mimetypes
+ import shutil
+ from .config import MAX_FILE_BYTES
+ from .project import require_project_dir, load_project, save_project
+-from .validation import validate_project
++from .validation import validate_project, wav_seconds, min_scene_seconds
+ from .docker_runner import run_in_sandbox
+ 
+ CATEGORY_DIRS = {
+@@ -30,6 +30,9 @@ CATEGORY_EXTENSIONS = {
+ # Text saved as a "narration" asset is the script, not audio (audio comes from generate_narration).
+ NARRATION_TEXT_EXTENSIONS = {".txt"}
+ 
++KIT_DIR = Path(__file__).resolve().parent / "kit"
++KIT_FILES = ("kit.css", "kit.js")
++
+ class ValidationFailed(ValueError):
+     """Raised by render() when the project does not pass validation."""
+ 
+@@ -60,6 +63,20 @@ def write_source(project_id: str, relative_path: str, content: str):
+     target.write_text(content, encoding="utf-8")
+     return {"path": target.relative_to(root.resolve()).as_posix()}
+ 
++def install_design_kit(project_id: str):
++    """Copy the design system (kit.css) and scene engine (kit.js) into source/."""
++    root = require_project_dir(project_id)
++    target = root / "source"
++    target.mkdir(parents=True, exist_ok=True)
++    for name in KIT_FILES:
++        shutil.copyfile(KIT_DIR / name, target / name)
++    return {
++        "files": [f"source/{n}" for n in KIT_FILES],
++        "html_head": '<link rel="stylesheet" href="kit.css">',
++        "html_end_of_body": '<script src="kit.js"></script>',
++        "note": "Use the kit classes from the system prompt. Do not re-implement the engine or the CSS.",
++    }
++
+ def write_storyboard(project_id: str, storyboard: dict):
+     # Some models send the object as a JSON string.
+     if isinstance(storyboard, str):
+@@ -158,11 +175,18 @@ def generate_narration(project_id: str, filename: str, text: str, rate: int = 17
+         n for n in manifest.get("narration", []) if n.get("filename") != filename
+     ] + [entry]
+     save_project(manifest)
+-    return {
++    seconds = wav_seconds(audio_path)
++    info = {
+         "path": f"narration/{filename}",
+         "text_path": entry["text_file"],
+         "stdout": result["stdout"],
+     }
++    if seconds is not None:
++        # The storyboard scene that plays this clip must be at least this long, otherwise
++        # the voice runs into the next scene's narration.
++        info["narration_seconds"] = round(seconds, 2)
++        info["min_scene_duration_seconds"] = min_scene_seconds(seconds)
++    return info
+ 
+ def validate(project_id: str):
+     return validate_project(project_id)
+diff --git a/app/validation.py b/app/validation.py
+index d53d8fa..515e701 100644
+--- a/app/validation.py
++++ b/app/validation.py
+@@ -1,5 +1,8 @@
+ from pathlib import Path
+ import json
++import math
++import re
++import wave
+ from .project import require_project_dir
+ from .config import MAX_PROJECT_BYTES, MAX_FILE_BYTES
+ 
+@@ -12,6 +15,25 @@ ALLOWED = {
+     "data": {".json", ".csv", ".txt"},
+ }
+ 
++# Narration starts this long after its scene starts (see sandbox/renderer/render.py) and the
++# scene needs a short hold after the last word before the cross-fade into the next scene.
++NARRATION_LEAD_SECONDS = 0.6
++NARRATION_TAIL_SECONDS = 0.8
++
++
++def wav_seconds(path: Path) -> float | None:
++    try:
++        with wave.open(str(path), "rb") as w:
++            return w.getnframes() / float(w.getframerate())
++    except (wave.Error, EOFError, OSError, ZeroDivisionError):
++        return None
++
++
++def min_scene_seconds(narration_seconds: float, offset: float = NARRATION_LEAD_SECONDS) -> float:
++    """Shortest scene (rounded up to 0.5s) that fits its narration with lead-in and hold."""
++    return math.ceil((offset + narration_seconds + NARRATION_TAIL_SECONDS) * 2) / 2
++
++
+ SOURCE_ALLOWED = {".html", ".css", ".js", ".mjs", ".json", ".txt"}
+ 
+ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
+@@ -62,6 +84,7 @@ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
+         else:
+             warnings.append("source/index.html does not exist yet.")
+ 
++    story_scenes: list = []
+     storyboard = root / "storyboard.json"
+     if not storyboard.exists():
+         if require_renderable:
+@@ -89,10 +112,27 @@ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
+                     if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
+                         errors.append(f"Storyboard scene {i} has invalid duration_seconds.")
+                     narration = scene.get("narration")
+-                    if narration and not (root / "narration" / Path(str(narration)).name).is_file():
+-                        errors.append(
+-                            f"Storyboard scene {i} references missing narration file: {narration}"
+-                        )
++                    if narration:
++                        clip = root / "narration" / Path(str(narration)).name
++                        if not clip.is_file():
++                            errors.append(
++                                f"Storyboard scene {i} references missing narration file: {narration}"
++                            )
++                        elif isinstance(duration, (int, float)) and not isinstance(duration, bool):
++                            seconds = wav_seconds(clip)
++                            offset = scene.get("narration_offset", NARRATION_LEAD_SECONDS)
++                            if seconds is not None and isinstance(offset, (int, float)):
++                                need = min_scene_seconds(seconds, offset)
++                                if duration + 1e-6 < need:
++                                    errors.append(
++                                        f"Scene '{scene.get('id')}': narration {Path(str(narration)).name} is "
++                                        f"{seconds:.1f}s long but the scene is only {duration}s. Set duration_seconds "
++                                        f"to at least {need} so the voice finishes before the transition."
++                                    )
++
++                story_scenes = scenes
++
++    _check_scene_markup(root, story_scenes, errors, warnings)
+ 
+     return {
+         "valid": not errors,
+@@ -101,3 +141,30 @@ def validate_project(project_id: str, require_renderable: bool = False) -> dict:
+         "total_bytes": total,
+         "file_count": sum(1 for p in root.rglob("*") if p.is_file()),
+     }
++
++
++def _check_scene_markup(root: Path, scenes: list, errors: list, warnings: list) -> None:
++    """Make sure index.html uses the design kit and has one data-scene section per storyboard scene."""
++    index = root / "source" / "index.html"
++    if not index.is_file():
++        return
++    html = index.read_text(encoding="utf-8", errors="replace")
++    if "kit.js" not in html or "kit.css" not in html:
++        warnings.append(
++            "index.html does not load kit.css/kit.js. Call install_design_kit and link both files "
++            "to get the design system, animations and scene transitions."
++        )
++        return
++    story_ids = [str(s.get("id")) for s in scenes if isinstance(s, dict) and s.get("id")]
++    if not story_ids:
++        return
++    html_ids = re.findall(r"""data-scene\s*=\s*["']([^"']+)["']""", html)
++    missing = [i for i in story_ids if i not in html_ids]
++    extra = [i for i in html_ids if i not in story_ids]
++    if missing:
++        errors.append(
++            "index.html has no <section class=\"scene\" data-scene=\"ID\"> for storyboard scene(s): "
++            + ", ".join(missing)
++        )
++    if extra:
++        errors.append("index.html has data-scene ids that are not in the storyboard: " + ", ".join(extra))
+diff --git a/examples/isro-journey/narration/milestones.txt b/examples/isro-journey/narration/milestones.txt
+new file mode 100644
+index 0000000..1243f03
+--- /dev/null
++++ b/examples/isro-journey/narration/milestones.txt
+@@ -0,0 +1 @@
++Aryabhata, India's first satellite, launched in nineteen seventy five. Chandrayaan one found water on the Moon in two thousand eight. And in two thousand fourteen, Mangalyaan reached Mars on its very first attempt.
+diff --git a/examples/isro-journey/narration/origin.txt b/examples/isro-journey/narration/origin.txt
+new file mode 100644
+index 0000000..2c9a39e
+--- /dev/null
++++ b/examples/isro-journey/narration/origin.txt
+@@ -0,0 +1 @@
++In nineteen sixty nine, India founded the Indian Space Research Organisation, with one bold goal: to use space technology for the benefit of the nation.
+diff --git a/examples/isro-journey/source/index.html b/examples/isro-journey/source/index.html
+new file mode 100644
+index 0000000..6a8f558
+--- /dev/null
++++ b/examples/isro-journey/source/index.html
+@@ -0,0 +1,64 @@
++<!DOCTYPE html>
++<html lang="en"><head><meta charset="utf-8"><title>ISRO Journey</title>
++<link rel="stylesheet" href="kit.css">
++<style>
++  #origin .orbit{position:relative;width:560px;height:560px;flex:none}
++  #origin .orbit svg{position:absolute;inset:0;width:100%;height:100%}
++  #origin .year{position:absolute;inset:0;display:grid;place-items:center;text-align:center}
++  #origin .year .big-number{font-size:112px}
++  .spin{animation:spin 24s linear infinite}
++  @keyframes spin{to{transform:rotate(360deg)}}
++  #milestones h2{margin-bottom:56px}
++  #milestones .glass .yr{font-size:28px;font-weight:700;letter-spacing:.14em;color:var(--accent)}
++</style></head>
++<body>
++<div class="bg"><i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i></div>
++
++<section class="scene" id="origin" data-scene="origin" data-transition="zoom">
++  <div class="row">
++    <div class="col grow">
++      <div class="eyebrow fade-in-down" style="--d:.1s">Our story begins</div>
++      <h1 class="title blur-in" style="--d:.25s">India reaches for<br><span class="grad-text">the stars</span></h1>
++      <p class="subtitle fade-in-up" style="--d:2.6s">The Indian Space Research Organisation is founded with one goal: space technology for the nation.</p>
++      <div class="row stagger" style="--base:5s;gap:20px;margin-top:16px">
++        <span class="chip pop"><i data-icon="rocket"></i>Launch vehicles</span>
++        <span class="chip pop"><i data-icon="satellite"></i>Satellites</span>
++        <span class="chip pop"><i data-icon="globe"></i>Service to society</span>
++      </div>
++    </div>
++    <div class="orbit scale-up" style="--d:.5s">
++      <svg viewBox="0 0 560 560">
++        <defs>
++          <radialGradient id="core" cx="35%" cy="30%" r="80%"><stop offset="0" stop-color="#9cc4ff"/><stop offset=".55" stop-color="#4f7cff"/><stop offset="1" stop-color="#1b2a6b"/></radialGradient>
++          <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6ea8ff"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
++          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="14"/></filter>
++        </defs>
++        <circle cx="280" cy="280" r="190" fill="#4f7cff" opacity=".45" filter="url(#glow)"/>
++        <circle cx="280" cy="280" r="170" fill="url(#core)"/>
++        <circle cx="280" cy="280" r="170" fill="none" stroke="rgba(255,255,255,.28)" stroke-width="2"/>
++        <circle class="draw" style="--d:.8s" pathLength="1" cx="280" cy="280" r="235" fill="none" stroke="url(#ring)" stroke-width="3" stroke-linecap="round"/>
++        <circle class="draw" style="--d:1.2s" pathLength="1" cx="280" cy="280" r="268" fill="none" stroke="rgba(255,255,255,.22)" stroke-width="2" />
++        <g class="spin"><g class="pop" style="--d:1.6s"><circle cx="280" cy="45" r="16" fill="#2dd4bf"/><circle cx="280" cy="45" r="30" fill="#2dd4bf" opacity=".25"/></g></g>
++      </svg>
++      <div class="year"><div><div class="label fade-in" style="--d:1.2s">Established</div>
++        <div class="big-number" data-count="1969" data-group="0" style="--d:1.3s">1969</div></div></div>
++    </div>
++  </div>
++</section>
++
++<section class="scene" id="milestones" data-scene="milestones" data-transition="slide">
++  <div class="eyebrow fade-in-down" style="--d:.1s">Milestones</div>
++  <h2 class="h2 fade-in-up" style="--d:.25s">Three giant <span class="grad-text">leaps</span></h2>
++  <div class="grid-3">
++    <div class="glass slide-in-left" style="--d:1.0s"><div class="icon-badge"><i data-icon="satellite"></i></div>
++      <div class="yr" style="margin-top:28px">1975</div><h3 style="margin-top:6px">Aryabhata</h3><p>India's first satellite reaches orbit.</p></div>
++    <div class="glass fade-in-up" style="--d:4.4s"><div class="icon-badge teal"><i data-icon="moon"></i></div>
++      <div class="yr" style="margin-top:28px">2008</div><h3 style="margin-top:6px">Chandrayaan-1</h3><p>Finds evidence of water on the Moon.</p></div>
++    <div class="glass slide-in-right" style="--d:8s"><div class="icon-badge amber"><i data-icon="rocket"></i></div>
++      <div class="yr" style="margin-top:28px">2014</div><h3 style="margin-top:6px">Mangalyaan</h3><p>Reaches Mars on the first attempt.</p></div>
++  </div>
++</section>
++
++<div class="progress"></div>
++<script src="kit.js"></script>
++</body></html>
+diff --git a/examples/isro-journey/source/kit.css b/examples/isro-journey/source/kit.css
+new file mode 100644
+index 0000000..b5fe897
+--- /dev/null
++++ b/examples/isro-journey/source/kit.css
+@@ -0,0 +1,137 @@
++/* Design kit for the HTML video compiler. 1920x1080 canvas. Installed as source/kit.css.
++   Everything animates only while its scene has .is-active (the engine in kit.js sets it). */
++:root{
++  --bg-0:#060913; --bg-1:#0b1226; --bg-2:#131c3a;
++  --ink:#f4f7ff; --ink-dim:rgba(226,232,255,.72); --ink-faint:rgba(226,232,255,.45);
++  --accent:#6ea8ff; --accent-2:#a78bfa; --accent-3:#2dd4bf; --warn:#fbbf24; --bad:#fb7185; --good:#34d399;
++  --glass-bg:linear-gradient(145deg,rgba(255,255,255,.12),rgba(255,255,255,.04));
++  --glass-line:rgba(255,255,255,.16);
++  --shadow:0 30px 80px -20px rgba(0,0,0,.65),0 8px 24px -8px rgba(0,0,0,.45);
++  --ease:cubic-bezier(.22,1,.36,1);          /* smooth out-expo-ish */
++  --ease-io:cubic-bezier(.65,0,.35,1);
++  --ease-spring:cubic-bezier(.34,1.56,.64,1);
++  --t:.8s;                                    /* scene transition length (keep == Kit.TRANSITION) */
++  --font:"Inter","Roboto","Helvetica Neue","DejaVu Sans","Noto Sans",sans-serif;
++}
++*{box-sizing:border-box;margin:0;padding:0}
++html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg-0);color:var(--ink);
++  font-family:var(--font);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
++
++/* ---------- animated background ---------- */
++.bg{position:fixed;inset:0;z-index:0;overflow:hidden;
++  background:
++   radial-gradient(1200px 800px at 15% 10%,rgba(110,168,255,.22),transparent 60%),
++   radial-gradient(1000px 700px at 90% 85%,rgba(167,139,250,.24),transparent 60%),
++   radial-gradient(900px 600px at 60% 40%,rgba(45,212,191,.10),transparent 65%),
++   linear-gradient(160deg,var(--bg-2),var(--bg-1) 45%,var(--bg-0))}
++.bg .orb{position:absolute;border-radius:50%;will-change:transform;animation:drift 22s var(--ease-io) infinite alternate}
++.bg .o1{width:1100px;height:1100px;left:-380px;top:-380px;background:radial-gradient(closest-side,rgba(59,130,246,.55),rgba(59,130,246,0))}
++.bg .o2{width:1000px;height:1000px;right:-340px;bottom:-380px;background:radial-gradient(closest-side,rgba(139,92,246,.5),rgba(139,92,246,0));animation-duration:27s}
++.bg .o3{width:760px;height:760px;left:44%;top:22%;background:radial-gradient(closest-side,rgba(20,184,166,.28),rgba(20,184,166,0));animation-duration:31s}
++.bg::after{content:"";position:absolute;inset:0;
++  background-image:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1.2px);background-size:46px 46px;
++  mask-image:radial-gradient(ellipse at center,#000 30%,transparent 75%)}
++@keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(120px,80px,0) scale(1.12)}}
++
++/* ---------- scenes + transitions ---------- */
++.scene{position:absolute;inset:0;z-index:1;display:flex;flex-direction:column;justify-content:center;gap:26px;
++  padding:110px 140px;visibility:hidden;opacity:0}
++.scene.is-active{visibility:visible;opacity:1;animation:scene-in var(--t) var(--ease) both}
++.scene.is-leaving{animation:scene-out var(--t) var(--ease-io) both}
++/* default = crossfade with a tiny scale; override with data-transition="slide|zoom|wipe" */
++@keyframes scene-in{from{opacity:0;transform:scale(1.025)}to{opacity:1;transform:none}}
++@keyframes scene-out{from{opacity:1;transform:none}to{opacity:0;transform:scale(.985)}}
++.scene[data-transition=slide].is-active{animation-name:slide-in}
++.scene[data-transition=slide].is-leaving{animation-name:slide-out}
++@keyframes slide-in{from{opacity:0;transform:translateX(160px)}to{opacity:1;transform:none}}
++@keyframes slide-out{from{opacity:1;transform:none}to{opacity:0;transform:translateX(-160px)}}
++.scene[data-transition=zoom].is-active{animation-name:zoom-in}
++.scene[data-transition=zoom].is-leaving{animation-name:zoom-out}
++@keyframes zoom-in{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:none}}
++@keyframes zoom-out{from{opacity:1;transform:none}to{opacity:0;transform:scale(1.12)}}
++.scene[data-transition=wipe].is-active{animation-name:wipe-in}
++.scene[data-transition=wipe].is-leaving{animation-name:wipe-out}
++@keyframes wipe-in{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}
++@keyframes wipe-out{from{opacity:1}to{opacity:0}}
++
++/* ---------- entrance animations (use on EVERY element; --d sets the delay) ---------- */
++.fade-in,.fade-in-up,.fade-in-down,.slide-in-left,.slide-in-right,.scale-up,.blur-in,.pop,.draw,.grow-x,.grow-y{opacity:0}
++.is-active .fade-in      {animation:a-fade   .9s var(--ease) var(--d,0s) both}
++.is-active .fade-in-up   {animation:a-up     1s  var(--ease) var(--d,0s) both}
++.is-active .fade-in-down {animation:a-down   1s  var(--ease) var(--d,0s) both}
++.is-active .slide-in-left{animation:a-left   1s  var(--ease) var(--d,0s) both}
++.is-active .slide-in-right{animation:a-right 1s  var(--ease) var(--d,0s) both}
++.is-active .scale-up     {animation:a-scale  .9s var(--ease-spring) var(--d,0s) both}
++.is-active .blur-in      {animation:a-blur   1.1s var(--ease) var(--d,0s) both}
++.is-active .pop          {animation:a-pop    .7s var(--ease-spring) var(--d,0s) both}
++.is-active .grow-x       {transform-origin:left center;animation:a-growx 1.2s var(--ease) var(--d,0s) both}
++.is-active .grow-y       {transform-origin:center bottom;animation:a-growy 1.2s var(--ease) var(--d,0s) both}
++.is-active .draw         {opacity:1;stroke-dasharray:1;stroke-dashoffset:1;animation:a-draw 1.6s var(--ease-io) var(--d,0s) forwards}
++@keyframes a-fade{from{opacity:0}to{opacity:1}}
++@keyframes a-up{from{opacity:0;transform:translateY(48px)}to{opacity:1;transform:none}}
++@keyframes a-down{from{opacity:0;transform:translateY(-48px)}to{opacity:1;transform:none}}
++@keyframes a-left{from{opacity:0;transform:translateX(-120px)}to{opacity:1;transform:none}}
++@keyframes a-right{from{opacity:0;transform:translateX(120px)}to{opacity:1;transform:none}}
++@keyframes a-scale{from{opacity:0;transform:scale(.7)}to{opacity:1;transform:none}}
++@keyframes a-blur{from{opacity:0;filter:blur(12px);transform:scale(1.05)}to{opacity:1;filter:none;transform:none}}
++@keyframes a-pop{0%{opacity:0;transform:scale(.4)}100%{opacity:1;transform:none}}
++@keyframes a-growx{from{opacity:1;transform:scaleX(0)}to{opacity:1;transform:scaleX(1)}}
++@keyframes a-growy{from{opacity:1;transform:scaleY(0)}to{opacity:1;transform:scaleY(1)}}
++@keyframes a-draw{to{stroke-dashoffset:0}}   /* SVG path needs pathLength="1" */
++/* children of .stagger animate one after another (set the animation class on each child) */
++.stagger>*:nth-child(1){--d:calc(var(--base,0s) + .00s)} .stagger>*:nth-child(2){--d:calc(var(--base,0s) + .14s)}
++.stagger>*:nth-child(3){--d:calc(var(--base,0s) + .28s)} .stagger>*:nth-child(4){--d:calc(var(--base,0s) + .42s)}
++.stagger>*:nth-child(5){--d:calc(var(--base,0s) + .56s)} .stagger>*:nth-child(6){--d:calc(var(--base,0s) + .70s)}
++.stagger>*:nth-child(7){--d:calc(var(--base,0s) + .84s)} .stagger>*:nth-child(8){--d:calc(var(--base,0s) + .98s)}
++/* continuous ambient motion (after the entrance finishes) */
++.float{animation:float 6s var(--ease-io) infinite alternate}
++.pulse{animation:pulse 2.4s var(--ease-io) infinite}
++@keyframes float{from{translate:0 -10px}to{translate:0 12px}}
++@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(110,168,255,.45)}60%{box-shadow:0 0 0 28px rgba(110,168,255,0)}}
++
++/* ---------- typography ---------- */
++.eyebrow{display:inline-flex;align-items:center;gap:14px;font-size:26px;font-weight:600;letter-spacing:.22em;
++  text-transform:uppercase;color:var(--accent)}
++.eyebrow::before{content:"";width:56px;height:3px;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
++.title{font-size:112px;line-height:1.02;font-weight:800;letter-spacing:-.035em}
++.h2{font-size:76px;line-height:1.06;font-weight:750;letter-spacing:-.028em}
++.subtitle{font-size:38px;line-height:1.4;font-weight:400;color:var(--ink-dim);max-width:1100px}
++.body{font-size:32px;line-height:1.45;color:var(--ink-dim)}
++.grad-text{background:linear-gradient(100deg,#9cc4ff,#c4b5fd 55%,#5eead4);-webkit-background-clip:text;background-clip:text;color:transparent}
++.big-number{font-size:150px;font-weight:800;letter-spacing:-.04em;line-height:1;font-variant-numeric:tabular-nums}
++.label{font-size:26px;font-weight:500;color:var(--ink-faint);letter-spacing:.04em}
++
++/* ---------- layout helpers ---------- */
++.row{display:flex;align-items:center;gap:60px}.col{display:flex;flex-direction:column;gap:28px}
++.grow{flex:1}.center{align-items:center;text-align:center;justify-content:center}
++.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:40px}
++.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:36px}
++.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:30px}
++
++/* ---------- glassmorphism cards ---------- */
++.glass{position:relative;background:var(--glass-bg);border:1px solid var(--glass-line);border-radius:36px;
++  padding:44px;box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.22);
++  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
++.glass h3{font-size:40px;font-weight:700;letter-spacing:-.015em;margin:22px 0 10px}
++.glass p{font-size:28px;line-height:1.45;color:var(--ink-dim)}
++.chip{display:inline-flex;align-items:center;gap:12px;padding:12px 26px;border-radius:999px;font-size:26px;font-weight:600;
++  background:rgba(110,168,255,.14);border:1px solid rgba(110,168,255,.35);color:#cfe0ff}
++.icon-badge{width:104px;height:104px;border-radius:30px;display:grid;place-items:center;color:#fff;
++  background:linear-gradient(145deg,var(--accent),var(--accent-2));box-shadow:0 18px 40px -10px rgba(110,168,255,.55),inset 0 1px 0 rgba(255,255,255,.4)}
++.icon-badge svg{width:56px;height:56px}
++.icon-badge.teal{background:linear-gradient(145deg,#2dd4bf,#3b82f6)}.icon-badge.amber{background:linear-gradient(145deg,#fbbf24,#fb7185)}
++.divider{height:2px;width:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.28),transparent)}
++.bar{height:22px;border-radius:12px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
++.timeline{position:relative;display:flex;justify-content:space-between;align-items:flex-start}
++.timeline::before{content:"";position:absolute;left:0;right:0;top:34px;height:4px;border-radius:4px;background:rgba(255,255,255,.14)}
++.timeline .node{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;max-width:300px}
++.timeline .dot{width:68px;height:68px;border-radius:50%;background:linear-gradient(145deg,var(--accent),var(--accent-2));
++  border:6px solid var(--bg-1);box-shadow:0 0 0 2px var(--accent)}
++
++/* ---------- global progress bar ---------- */
++.progress{position:fixed;left:0;bottom:0;height:6px;width:100%;z-index:5;transform-origin:left;transform:scaleX(0);
++  background:linear-gradient(90deg,var(--accent),var(--accent-2),var(--accent-3))}
++svg{overflow:visible}
++/* so scale/rotate animations on SVG children pivot around their own centre */
++svg [class]{transform-box:fill-box;transform-origin:center}
++svg .spin{transform-box:view-box;transform-origin:50% 50%}
+diff --git a/examples/isro-journey/source/kit.js b/examples/isro-journey/source/kit.js
+new file mode 100644
+index 0000000..8c4cdd2
+--- /dev/null
++++ b/examples/isro-journey/source/kit.js
+@@ -0,0 +1,127 @@
++/* Scene engine for the HTML video compiler. Installed as source/kit.js.
++ * - Scene durations come from the storyboard: render.py injects window.__VIDEO_SCENES__
++ *   ([{id,duration}]) and scenes are matched by <section class="scene" data-scene="ID">.
++ *   (data-duration="N" is only a fallback for opening the page by hand.)
++ * - Time is performance.now() (ms since navigation), the same clock render.py uses to
++ *   align the recording and the narration, so visuals and audio cannot drift apart.
++ * - Scene i is shown from its start; at its end the NEXT scene starts and scene i
++ *   cross-fades out over TRANSITION seconds, so there are never hard cuts.
++ */
++(function () {
++  var TRANSITION = 0.8; // keep equal to --t in kit.css
++
++  var ICONS = {
++    rocket: '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>',
++    globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
++    moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/>',
++    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>',
++    star: '<path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/>',
++    zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
++    clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
++    check: '<path d="M20 6 9 17l-5-5"/>',
++    arrow: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
++    chart: '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
++    users: '<circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/><path d="M21 21v-2a4 4 0 0 0-3-3.87"/>',
++    lightbulb: '<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/>',
++    target: '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
++    layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
++    shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
++    flag: '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22v-7"/>',
++    play: '<polygon points="6 3 20 12 6 21 6 3"/>',
++    satellite: '<g transform="rotate(-45 12 12)"><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><rect x="1.5" y="8" width="6" height="8" rx="1"/><rect x="16.5" y="8" width="6" height="8" rx="1"/><path d="M7.5 12h2M14.5 12h2M12 9.5V6.5"/></g>'
++  };
++
++  function hydrateIcons(root) {
++    root.querySelectorAll('[data-icon]').forEach(function (el) {
++      var body = ICONS[el.getAttribute('data-icon')];
++      if (!body || el.querySelector('svg')) return;
++      el.insertAdjacentHTML('beforeend',
++        '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" ' +
++        'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' + body + '</svg>');
++    });
++  }
++
++  function easeOut(p) { return 1 - Math.pow(1 - p, 4); }
++
++  // <span data-count="1969" data-prefix="" data-suffix="" data-decimals="0" data-group="0">
++  function startCounters(scene, now) {
++    scene.querySelectorAll('[data-count]').forEach(function (el) {
++      var to = parseFloat(el.getAttribute('data-count'));
++      if (isNaN(to)) return;
++      var dec = parseInt(el.getAttribute('data-decimals') || '0', 10);
++      var pre = el.getAttribute('data-prefix') || '', suf = el.getAttribute('data-suffix') || '';
++      var group = el.getAttribute('data-group') !== '0' && Math.abs(to) >= 10000;
++      var delay = parseFloat((getComputedStyle(el).getPropertyValue('--d') || '0').replace('s', '')) || 0;
++      var dur = parseFloat(el.getAttribute('data-count-duration') || '1.8');
++      var t0 = now + delay;
++      function fmt(v) {
++        var s = v.toFixed(dec);
++        return pre + (group ? Number(s).toLocaleString('en-US', {minimumFractionDigits: dec}) : s) + suf;
++      }
++      el.textContent = fmt(0);
++      (function step() {
++        var p = (performance.now() / 1000 - t0) / dur;
++        if (p < 0) { requestAnimationFrame(step); return; }
++        el.textContent = fmt(to * easeOut(Math.min(p, 1)));
++        if (p < 1) requestAnimationFrame(step);
++      })();
++    });
++  }
++
++  function init() {
++    hydrateIcons(document);
++    var scenes = Array.prototype.slice.call(document.querySelectorAll('.scene'));
++    var plan = window.__VIDEO_SCENES__ || [];
++    var byId = {};
++    plan.forEach(function (s) { byId[s.id] = s; });
++
++    var cursor = 0;
++    var timeline = scenes.map(function (el, i) {
++      var p = byId[el.getAttribute('data-scene')] || plan[i];
++      var dur = p ? Number(p.duration) : parseFloat(el.getAttribute('data-duration'));
++      if (!(dur > 0)) {
++        console.error('Scene ' + (el.getAttribute('data-scene') || i) + ' has no duration. ' +
++          'Give it data-scene="<storyboard id>" matching a storyboard scene.');
++        dur = 3;
++      }
++      var entry = {el: el, start: cursor, end: cursor + dur, state: 'idle'};
++      cursor += dur;
++      return entry;
++    });
++    if (window.__VIDEO_TOTAL__ && Math.abs(window.__VIDEO_TOTAL__ - cursor) > 0.05) {
++      console.error('HTML has ' + scenes.length + ' scenes totalling ' + cursor.toFixed(2) +
++        's but the storyboard totals ' + Number(window.__VIDEO_TOTAL__).toFixed(2) + 's.');
++    }
++
++    var bar = document.querySelector('.progress');
++    var last = timeline.length - 1;
++
++    function tick() {
++      var t = performance.now() / 1000;
++      timeline.forEach(function (s, i) {
++        var el = s.el;
++        if (t >= s.start && s.state === 'idle') {
++          s.state = 'active';
++          el.classList.add('is-active');
++          startCounters(el, t);
++        }
++        // The last scene holds its final frame; every other scene fades out at its end.
++        if (i < last && t >= s.end && s.state === 'active') {
++          s.state = 'leaving';
++          el.classList.add('is-leaving');
++        }
++        if (s.state === 'leaving' && t >= s.end + TRANSITION) {
++          s.state = 'done';
++          el.classList.remove('is-active', 'is-leaving');
++        }
++      });
++      if (bar) bar.style.transform = 'scaleX(' + Math.min(1, t / (cursor || 1)) + ')';
++      requestAnimationFrame(tick);
++    }
++    requestAnimationFrame(tick);
++  }
++
++  window.Kit = {TRANSITION: TRANSITION, icons: ICONS};
++  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
++  else init();
++})();
+diff --git a/examples/isro-journey/storyboard.json b/examples/isro-journey/storyboard.json
+new file mode 100644
+index 0000000..3834a41
+--- /dev/null
++++ b/examples/isro-journey/storyboard.json
+@@ -0,0 +1,6 @@
++{
++  "scenes": [
++    {"id": "origin", "title": "1969: ISRO is founded", "duration_seconds": 11, "narration": "origin.wav"},
++    {"id": "milestones", "title": "Three giant leaps", "duration_seconds": 14.5, "narration": "milestones.wav"}
++  ]
++}
+diff --git a/sandbox/Dockerfile b/sandbox/Dockerfile
+index 8450c56..0ea456f 100644
+--- a/sandbox/Dockerfile
++++ b/sandbox/Dockerfile
+@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     chromium-driver \
+     espeak-ng \
+     libespeak-ng1 \
++    fonts-inter \
++    fonts-roboto \
+     fonts-dejavu \
+     fonts-liberation \
+     fonts-noto \
+diff --git a/sandbox/renderer/render.py b/sandbox/renderer/render.py
+index 8b6baed..53c9614 100644
+--- a/sandbox/renderer/render.py
++++ b/sandbox/renderer/render.py
+@@ -8,6 +8,11 @@ from pathlib import Path
+ # Extra seconds recorded after the storyboard ends so trimming to the exact length never
+ # cuts the last frames short.
+ TAIL_SECONDS = 0.5
++# Narration starts this long after its scene starts, so the scene's cross-fade and first
++# entrance animations finish before the voice begins. Keep in sync with app/validation.py.
++NARRATION_LEAD_SECONDS = 0.6
++# Tolerated overlap between consecutive clips / the end of the video (float noise).
++OVERLAP_EPSILON = 0.05
+ MAX_BROWSER_MESSAGES = 20
+ 
+ 
+@@ -38,9 +43,14 @@ def wav_duration(path: Path) -> float:
+ def plan_audio(project: Path, scenes):
+     """Decide which narration clips go into the video and when they start.
+ 
+-    A scene can set "narration": "<file>.wav" and that clip starts with the scene. If no
+-    scene references narration but narration/*.wav exist, the clips play back to back from
+-    the start, in file-name order. Returns [(path, start_seconds), ...].
++    A scene can set "narration": "<file>.wav"; that clip starts NARRATION_LEAD_SECONDS
++    (or the scene's own "narration_offset") after the scene starts. If no scene references
++    narration but narration/*.wav exist, the clips play back to back from the start, in
++    file-name order. Returns [(path, start_seconds), ...].
++
++    Clips must never overlap each other or run past the end of the video: that is what made
++    narration play over itself. Instead of mixing a mess, this raises an error that tells
++    the author which scene needs to be longer.
+     """
+     narration_dir = project / "narration"
+     available = {p.name: p for p in sorted(narration_dir.glob("*.wav"))} if narration_dir.is_dir() else {}
+@@ -54,14 +64,26 @@ def plan_audio(project: Path, scenes):
+             clip = available.get(Path(str(name)).name)
+             if clip is None:
+                 raise RuntimeError(f"Scene {scene.get('id')} references missing narration file: {name}")
+-            tracks.append((clip, start))
++            offset = float(scene.get("narration_offset", NARRATION_LEAD_SECONDS))
++            tracks.append((clip, start + max(0.0, offset), scene.get("id")))
+         start += float(scene["duration_seconds"])
++    total = start
+     if not referenced:
+         t = 0.0
+         for clip in available.values():
+-            tracks.append((clip, t))
++            tracks.append((clip, t, None))
+             t += wav_duration(clip)
+-    return tracks
++
++    for i, (clip, begin, scene_id) in enumerate(tracks):
++        end = begin + wav_duration(clip)
++        limit = tracks[i + 1][1] if i + 1 < len(tracks) else total
++        if end > limit + OVERLAP_EPSILON:
++            what = "the next narration clip starts" if i + 1 < len(tracks) else "the video ends"
++            raise RuntimeError(
++                f"Narration {clip.name} (scene {scene_id}) runs until {end:.2f}s but {what} at {limit:.2f}s. "
++                f"Increase that scene's duration_seconds by at least {end - limit + 0.5:.1f}s or shorten the text."
++            )
++    return [(clip, begin) for clip, begin, _ in tracks]
+ 
+ 
+ def build_ffmpeg_cmd(src: Path, dst: Path, fps: int, total: float, offset: float, tracks):
+@@ -154,6 +176,9 @@ def render(project: Path, width: int, height: int, fps: int):
+             ],
+         )
+ 
++        scenes_json = json.dumps(
++            [{"id": sc.get("id"), "duration": float(sc["duration_seconds"])} for sc in storyboard["scenes"]]
++        )
+         context = browser.new_context(
+             viewport={"width": width, "height": height},
+             record_video_dir=str(out_dir),
+@@ -166,6 +191,9 @@ def render(project: Path, width: int, height: int, fps: int):
+                 "window.__VIDEO_EXPORT__ = true;"
+                 f"window.__VIDEO_FPS__ = {int(fps)};"
+                 f"window.__VIDEO_TOTAL__ = {float(total)};"
++                # Scene ids + durations from storyboard.json: the page's scene engine
++                # (kit.js) reads these, so HTML timing cannot disagree with the storyboard.
++                f"window.__VIDEO_SCENES__ = {scenes_json};"
+             )
+         )
+ 
+diff --git a/sandbox/renderer/tts.py b/sandbox/renderer/tts.py
+index 75e8d88..1428622 100644
+--- a/sandbox/renderer/tts.py
++++ b/sandbox/renderer/tts.py
+@@ -20,7 +20,8 @@ def synthesize(text: str, output: Path, rate: int = 170, volume: float = 1.0):
+         "-s", str(int(rate)),                 # words per minute
+         "-a", str(int(round(volume * 200))),  # amplitude 0-200
+         "-w", str(output),                    # write WAV to file
+-        "-f", "-",                            # read text from stdin (no argv length limits)
++        "--stdin",                            # read text from stdin (no argv length limits);
++                                              # note: "-f -" does NOT work, espeak-ng stat()s a file named "-"
+     ]
+     try:
+         proc = subprocess.run(cmd, input=text, capture_output=True, text=True, timeout=120)
+diff --git a/tests/test_backend.py b/tests/test_backend.py
+index 23a41af..5f03d9c 100644
+--- a/tests/test_backend.py
++++ b/tests/test_backend.py
+@@ -409,5 +409,73 @@ def test_agent_tool_names_match_dispatcher():
+     schema_names = {t["function"]["name"] for t in agent._tool_schemas()}
+     assert schema_names == {
+         "write_storyboard", "write_source", "save_text_asset", "generate_narration",
+-        "ingest_host_asset", "validate_project", "render_video",
++        "ingest_host_asset", "validate_project", "render_video", "install_design_kit",
+     }
++
++
++# ------------------------------------------------------------------ design kit / audio sync
++
++def _wav(path, seconds):
++    import wave
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with wave.open(str(path), "wb") as w:
++        w.setnchannels(1)
++        w.setsampwidth(2)
++        w.setframerate(8000)
++        w.writeframes(b"\x00\x00" * int(8000 * seconds))
++
++
++def test_install_design_kit_copies_css_and_engine(project):
++    result = tools.install_design_kit(project)
++    root = project_dir(project) / "source"
++    assert (root / "kit.css").read_text().count(".fade-in-up") > 0
++    assert "__VIDEO_SCENES__" in (root / "kit.js").read_text()
++    assert result["files"] == ["source/kit.css", "source/kit.js"]
++
++
++def test_validation_rejects_narration_longer_than_its_scene(project):
++    root = project_dir(project)
++    _wav(root / "narration" / "s1.wav", 6.0)
++    (root / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "s1", "duration_seconds": 6, "narration": "s1.wav"}]})
++    )
++    result = validation.validate_project(project)
++    assert not result["valid"]
++    assert "at least 7.5" in " ".join(result["errors"])  # 0.6 lead + 6.0 + 0.8 hold -> 7.5
++
++
++def test_validation_accepts_narration_that_fits(project):
++    root = project_dir(project)
++    _wav(root / "narration" / "s1.wav", 6.0)
++    (root / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "s1", "duration_seconds": 7.5, "narration": "s1.wav"}]})
++    )
++    assert validation.validate_project(project)["valid"]
++
++
++def test_validation_checks_scene_ids_in_index_html(project):
++    root = project_dir(project)
++    tools.install_design_kit(project)
++    (root / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "a", "duration_seconds": 3}, {"id": "b", "duration_seconds": 3}]})
++    )
++    html = (
++        '<link rel="stylesheet" href="kit.css"><section class="scene" data-scene="a"></section>'
++        '<section class="scene" data-scene="zzz"></section><script src="kit.js"></script>'
++    )
++    (root / "source" / "index.html").write_text(html)
++    errors = " ".join(validation.validate_project(project)["errors"])
++    assert "b" in errors and "zzz" in errors
++
++
++def test_validation_warns_when_kit_is_not_used(project):
++    root = project_dir(project)
++    (root / "source").mkdir(exist_ok=True)
++    (root / "source" / "index.html").write_text("<html></html>")
++    assert any("kit.css" in w for w in validation.validate_project(project)["warnings"])
++
++
++def test_system_prompt_enforces_the_design_and_sync_rules():
++    text = agent.SYSTEM
++    for needle in ["install_design_kit", "fade-in-up", "cubic-bezier", "data-scene", "min_scene_duration_seconds", "glass", "inline <svg"]:
++        assert needle in text, needle
+diff --git a/tests/test_renderer.py b/tests/test_renderer.py
+index ae588af..3473e57 100644
+--- a/tests/test_renderer.py
++++ b/tests/test_renderer.py
+@@ -70,7 +70,8 @@ def test_plan_audio_places_clip_at_its_scene_start(tmp_path):
+         {"id": "c", "duration_seconds": 6, "narration": "narration/three.wav"},
+     ]
+     plan = render.plan_audio(tmp_path, scenes)
+-    assert [(p.name, s) for p, s in plan] == [("two.wav", 4.0), ("three.wav", 9.0)]
++    lead = render.NARRATION_LEAD_SECONDS
++    assert [(p.name, s) for p, s in plan] == [("two.wav", 4.0 + lead), ("three.wav", 9.0 + lead)]
+ 
+ 
+ def test_plan_audio_falls_back_to_back_to_back_clips(tmp_path):
+@@ -81,6 +82,36 @@ def test_plan_audio_falls_back_to_back_to_back_clips(tmp_path):
+     assert [(p.name, round(s, 2)) for p, s in plan] == [("a.wav", 0.0), ("b.wav", 1.0)]
+ 
+ 
++def test_plan_audio_rejects_clips_that_would_overlap(tmp_path):
++    (tmp_path / "narration").mkdir()
++    make_wav(tmp_path / "narration" / "long.wav", seconds=3.0)
++    make_wav(tmp_path / "narration" / "next.wav", seconds=0.5)
++    scenes = [
++        {"id": "a", "duration_seconds": 2, "narration": "long.wav"},
++        {"id": "b", "duration_seconds": 4, "narration": "next.wav"},
++    ]
++    with pytest.raises(RuntimeError, match="scene a.*Increase that scene"):
++        render.plan_audio(tmp_path, scenes)
++
++
++def test_plan_audio_rejects_clip_running_past_the_end(tmp_path):
++    (tmp_path / "narration").mkdir()
++    make_wav(tmp_path / "narration" / "long.wav", seconds=3.0)
++    with pytest.raises(RuntimeError, match="video ends"):
++        render.plan_audio(tmp_path, [{"id": "a", "duration_seconds": 3, "narration": "long.wav"}])
++
++
++def test_plan_audio_allows_back_to_back_clips_that_fit(tmp_path):
++    (tmp_path / "narration").mkdir()
++    make_wav(tmp_path / "narration" / "a.wav", seconds=2.0)
++    make_wav(tmp_path / "narration" / "b.wav", seconds=2.0)
++    scenes = [
++        {"id": "a", "duration_seconds": 4, "narration": "a.wav"},
++        {"id": "b", "duration_seconds": 4, "narration": "b.wav"},
++    ]
++    assert [round(st, 2) for _, st in render.plan_audio(tmp_path, scenes)] == [0.6, 4.6]
++
++
+ def test_plan_audio_without_any_narration_is_empty(tmp_path):
+     assert render.plan_audio(tmp_path, [{"id": "s", "duration_seconds": 3}]) == []
+ 
+@@ -214,48 +245,54 @@ def test_tts_accepts_text_file_or_text_but_not_both_or_neither():
+         tts.parse_args(["--text", "a", "--text-file", "b", "--output", "/o.wav"])
+ 
+ 
+-class _StubEngine:
+-    def __init__(self, writes):
+-        self.writes = writes
+-        self.path = None
+-        self.props = {}
+-
+-    def setProperty(self, key, value):
+-        self.props[key] = value
+-
+-    def save_to_file(self, text, path):
+-        self.path = path
++def _stub_espeak(monkeypatch, writes, returncode=0, stderr=""):
++    """Replace subprocess.run so no real espeak-ng is needed; records the call."""
++    calls = {}
+ 
+-    def runAndWait(self):
+-        if self.writes:
+-            Path(self.path).write_bytes(b"RIFFdata")
++    def fake_run(cmd, input=None, **kwargs):
++        calls["cmd"], calls["input"] = cmd, input
++        if writes:
++            Path(cmd[cmd.index("-w") + 1]).write_bytes(b"RIFFdata")
++        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr=stderr)
+ 
+-
+-def _stub_pyttsx3(monkeypatch, writes):
+-    engine = _StubEngine(writes)
+-    module = type(sys)("pyttsx3")
+-    module.init = lambda: engine
+-    monkeypatch.setitem(sys.modules, "pyttsx3", module)
+-    return engine
++    monkeypatch.setattr(tts.subprocess, "run", fake_run)
++    return calls
+ 
+ 
+ def test_tts_writes_the_file_and_clamps_volume(tmp_path, monkeypatch):
+-    engine = _stub_pyttsx3(monkeypatch, writes=True)
++    calls = _stub_espeak(monkeypatch, writes=True)
+     out = tmp_path / "n" / "a.wav"
+     tts.synthesize("hello", out, rate=150, volume=7.0)
+     assert out.read_bytes() == b"RIFFdata"
+-    assert engine.props == {"rate": 150, "volume": 1.0}
++    cmd = calls["cmd"]
++    assert cmd[cmd.index("-s") + 1] == "150"
++    assert cmd[cmd.index("-a") + 1] == "200"  # volume clamped to 1.0 -> amplitude 200
++    assert calls["input"] == "hello"
++
++
++def test_tts_reads_stdin_not_a_file_named_dash(tmp_path, monkeypatch):
++    # Regression: espeak-ng treats "-f -" as a file called "-" ("Failed to stat() file '-'").
++    calls = _stub_espeak(monkeypatch, writes=True)
++    tts.synthesize("hello", tmp_path / "a.wav")
++    assert "--stdin" in calls["cmd"]
++    assert "-f" not in calls["cmd"]
+ 
+ 
+ def test_tts_does_not_mistake_a_stale_file_for_success(tmp_path, monkeypatch):
+-    _stub_pyttsx3(monkeypatch, writes=False)
++    _stub_espeak(monkeypatch, writes=False)
+     out = tmp_path / "a.wav"
+     out.write_bytes(b"old")
+     with pytest.raises(RuntimeError):
+         tts.synthesize("hello", out)
+ 
+ 
++def test_tts_surfaces_espeak_errors(tmp_path, monkeypatch):
++    _stub_espeak(monkeypatch, writes=False, returncode=1, stderr="boom")
++    with pytest.raises(RuntimeError, match="boom"):
++        tts.synthesize("hello", tmp_path / "a.wav")
++
++
+ def test_tts_rejects_empty_text(tmp_path, monkeypatch):
+-    _stub_pyttsx3(monkeypatch, writes=True)
++    _stub_espeak(monkeypatch, writes=True)
+     with pytest.raises(RuntimeError):
+         tts.synthesize("  \n ", tmp_path / "a.wav")

@@ -1,0 +1,6 @@
+{
+  "scenes": [
+    {"id": "origin", "title": "1969: ISRO is founded", "duration_seconds": 11, "narration": "origin.wav"},
+    {"id": "milestones", "title": "Three giant leaps", "duration_seconds": 14.5, "narration": "milestones.wav"}
+  ]
+}
