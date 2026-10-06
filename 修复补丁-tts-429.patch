@@ -1,0 +1,118 @@
+From 6d4901cbaa6393ee46827bdaffa2dc2c0624f9a8 Mon Sep 17 00:00:00 2001
+From: fix <fix@local>
+Date: Tue, 6 Oct 2026 12:05:00 +0800
+Subject: [PATCH] Fix TTS (espeak-ng CLI) and Groq 429 retry
+
+---
+ app/agent.py            | 27 +++++++++++++++++++++++++--
+ sandbox/renderer/tts.py | 39 ++++++++++++++++++++++++++++++++-------
+ 2 files changed, 57 insertions(+), 9 deletions(-)
+
+diff --git a/app/agent.py b/app/agent.py
+index 52b23e0..8b56893 100644
+--- a/app/agent.py
++++ b/app/agent.py
+@@ -1,9 +1,31 @@
+-from openai import OpenAI
++from openai import OpenAI, RateLimitError
+ import json
++import re
++import time
+ from .config import GROQ_API_KEY, GROQ_MODEL
+ from .project import project_dir, load_project, list_files
+ from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render
+ 
++MAX_RETRIES = 6
++
++def _retry_after_seconds(exc: RateLimitError) -> float | None:
++    """Groq tells us the exact wait in the error body ('Please try again in 5.895s')."""
++    m = re.search(r"try again in ([\d.]+)s", str(exc), re.IGNORECASE)
++    return float(m.group(1)) if m else None
++
++def _create_completion_with_retry(client, **kwargs):
++    """Groq's on-demand tier is TPM-limited; wait out the window and retry instead of dying."""
++    for attempt in range(MAX_RETRIES):
++        try:
++            return client.chat.completions.create(**kwargs)
++        except RateLimitError as exc:
++            if attempt == MAX_RETRIES - 1:
++                raise
++            delay = _retry_after_seconds(exc)
++            if delay is None:
++                delay = min(2 ** attempt * 5, 60)  # 5s, 10s, 20s, ... capped at 60s
++            time.sleep(delay + 0.5)
++
+ SYSTEM = r"""
+ You are the director/engineering agent for a deterministic HTML video compiler.
+ 
+@@ -217,7 +239,8 @@ def run_agent(project_id: str, instruction: str | None = None):
+     supplied_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
+ 
+     for _ in range(30):
+-        response = client.chat.completions.create(
++        response = _create_completion_with_retry(
++            client,
+             model=GROQ_MODEL,
+             messages=messages,
+             tools=_tool_schemas(),
+diff --git a/sandbox/renderer/tts.py b/sandbox/renderer/tts.py
+index 365cc9c..75e8d88 100644
+--- a/sandbox/renderer/tts.py
++++ b/sandbox/renderer/tts.py
+@@ -1,21 +1,46 @@
+ import argparse
++import subprocess
+ from pathlib import Path
+ 
+ 
+ def synthesize(text: str, output: Path, rate: int = 170, volume: float = 1.0):
+-    import pyttsx3  # imported lazily so argument handling can be tested without a speech engine
+-
+     text = (text or "").strip()
+     if not text:
+         raise RuntimeError("Narration text is empty.")
+     output.parent.mkdir(parents=True, exist_ok=True)
+     output.unlink(missing_ok=True)  # a stale file must never pass the check below
+ 
+-    engine = pyttsx3.init()
+-    engine.setProperty("rate", rate)
+-    engine.setProperty("volume", max(0.0, min(volume, 1.0)))
+-    engine.save_to_file(text, str(output))
+-    engine.runAndWait()
++    # pyttsx3's Linux driver binds to the classic libespeak.so.1 ABI; the sandbox
++    # ships espeak-ng (libespeak-ng.so.1), which silently produces no file through
++    # pyttsx3. The espeak-ng CLI is installed in the image and is deterministic.
++    volume = max(0.0, min(volume, 1.0))
++    cmd = [
++        "espeak-ng",
++        "-v", "en",
++        "-s", str(int(rate)),                 # words per minute
++        "-a", str(int(round(volume * 200))),  # amplitude 0-200
++        "-w", str(output),                    # write WAV to file
++        "-f", "-",                            # read text from stdin (no argv length limits)
++    ]
++    try:
++        proc = subprocess.run(cmd, input=text, capture_output=True, text=True, timeout=120)
++    except FileNotFoundError:
++        proc = None  # espeak-ng missing: fall back to pyttsx3 below
++    if proc is not None and proc.returncode != 0:
++        raise RuntimeError(f"espeak-ng failed: {proc.stderr.strip() or proc.stdout.strip()}")
++
++    if (not output.exists() or output.stat().st_size == 0) and proc is None:
++        try:
++            import pyttsx3  # fallback for environments without the espeak-ng CLI
++        except ImportError:
++            pyttsx3 = None
++        if pyttsx3 is not None:
++            engine = pyttsx3.init()
++            engine.setProperty("rate", rate)
++            engine.setProperty("volume", volume)
++            engine.save_to_file(text, str(output))
++            engine.runAndWait()
++
+     if not output.exists() or output.stat().st_size == 0:
+         raise RuntimeError("TTS did not produce an audio file.")
+ 
+-- 
+2.39.5
+

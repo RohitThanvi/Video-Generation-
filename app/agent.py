@@ -1,8 +1,30 @@
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 import json
+import re
+import time
 from .config import GROQ_API_KEY, GROQ_MODEL
 from .project import project_dir, load_project, list_files
 from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render
+
+MAX_RETRIES = 6
+
+def _retry_after_seconds(exc: RateLimitError) -> float | None:
+    """Groq tells us the exact wait in the error body ('Please try again in 5.895s')."""
+    m = re.search(r"try again in ([\d.]+)s", str(exc), re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+def _create_completion_with_retry(client, **kwargs):
+    """Groq's on-demand tier is TPM-limited; wait out the window and retry instead of dying."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except RateLimitError as exc:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            delay = _retry_after_seconds(exc)
+            if delay is None:
+                delay = min(2 ** attempt * 5, 60)  # 5s, 10s, 20s, ... capped at 60s
+            time.sleep(delay + 0.5)
 
 SYSTEM = r"""
 You are the director/engineering agent for a deterministic HTML video compiler.
@@ -217,7 +239,8 @@ def run_agent(project_id: str, instruction: str | None = None):
     supplied_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
 
     for _ in range(30):
-        response = client.chat.completions.create(
+        response = _create_completion_with_retry(
+            client,
             model=GROQ_MODEL,
             messages=messages,
             tools=_tool_schemas(),
