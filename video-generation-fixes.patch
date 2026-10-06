@@ -1,0 +1,2104 @@
+From c0f3084dd92faf7db4136527c03acf2b1aa5db9e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 5 Oct 2026 19:09:39 +0000
+Subject: [PATCH] Fix render pipeline, API error handling, UI wiring and Docker
+ setup
+
+Rendering
+- sandbox: install Playwright's ffmpeg (record_video needs it; every render
+  failed without it) and replace the libespeak1 package with libespeak-ng1
+- render.py: mix narration into the MP4 (it was generated but never used),
+  trim the recording to the storyboard length aligned to page start, define
+  __VIDEO_* flags before page scripts run, allow file:// module scripts, and
+  report browser console/network errors in the result
+- tts.py: read text from a file (no argv length / leading-dash problems),
+  drop stale output before synthesizing, clamp volume
+
+Backend
+- validation: no longer crashes on malformed storyboards; a large final.mp4
+  no longer fails every later validation; render now requires index.html and
+  storyboard.json up front; reject bool durations and missing narration files
+- tools: even-dimension/fps checks, path hardening for write_source, extension
+  checks for text assets, no duplicate narration entries, stale-audio guard
+- docker_runner: kill the container on timeout (it kept running), writable
+  HOME on the read-only sandbox, HOST_PROJECT_ROOT for compose, truncated
+  errors and a hint when the daemon/image is missing
+- main/project: validate project ids, 404 instead of creating stray dirs,
+  upload size limit (413), real status codes, optional request bodies,
+  no-store video responses
+- agent: accept empty tool arguments, string storyboards, name unknown tools;
+  the model can only ingest host paths the user wrote themselves
+
+Frontend
+- validate button read r.ok but the API returns `valid`
+- render handler pointed at a /render-file route that does not exist; use
+  /video, and hide a stale video when switching projects
+
+Infra / docs
+- real API Dockerfile (it only contained comments), compose publishes on
+  loopback and maps the host project path, .dockerignore
+- README: remove corrupted UTF-16 tail, fix render output path, document
+  narration, compose and tests
+- add tests (62) and requirements-dev.txt
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NcAwjchdbi5Eq6yZ1zyXGN
+---
+ .dockerignore              |   9 +
+ .env.example               |   4 +
+ .gitignore                 |   1 +
+ Dockerfile                 |  19 +-
+ Makefile                   |   3 +
+ README.md                  | Bin 5323 -> 6410 bytes
+ app/agent.py               |  40 +++-
+ app/config.py              |  12 +-
+ app/docker_runner.py       |  58 +++++-
+ app/main.py                |  84 +++++---
+ app/models.py              |  18 +-
+ app/project.py             |  19 +-
+ app/static/app.js          |   9 +-
+ app/tools.py               | 121 ++++++++---
+ app/validation.py          |  74 +++++--
+ docker-compose.yml         |   9 +-
+ requirements-dev.txt       |   3 +
+ sandbox/Dockerfile         |   7 +-
+ sandbox/renderer/render.py | 186 +++++++++++++----
+ sandbox/renderer/tts.py    |  30 ++-
+ tests/conftest.py          |  77 +++++++
+ tests/test_backend.py      | 413 +++++++++++++++++++++++++++++++++++++
+ tests/test_renderer.py     | 261 +++++++++++++++++++++++
+ 23 files changed, 1309 insertions(+), 148 deletions(-)
+ create mode 100644 .dockerignore
+ create mode 100644 requirements-dev.txt
+ create mode 100644 tests/conftest.py
+ create mode 100644 tests/test_backend.py
+ create mode 100644 tests/test_renderer.py
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..d375536
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,9 @@
++.git
++.venv
++.env
++.pytest_cache
++__pycache__
++*.pyc
++projects/*
++!projects/.gitkeep
++tests
+diff --git a/.env.example b/.env.example
+index e57631b..ea09f39 100644
+--- a/.env.example
++++ b/.env.example
+@@ -4,7 +4,11 @@ GROQ_MODEL=openai/gpt-oss-120b
+ API_HOST=127.0.0.1
+ API_PORT=8000
+ 
++# Relative paths are resolved against the repository, not the current directory.
+ PROJECT_ROOT=./projects
++# Only for docker-compose: the absolute HOST path of ./projects (e.g. /home/me/Video-Generation-/projects).
++# Leave empty when running uvicorn directly.
++HOST_PROJECT_ROOT=
+ 
+ SANDBOX_IMAGE=ai-video-sandbox:latest
+ SANDBOX_MEMORY=6g
+diff --git a/.gitignore b/.gitignore
+index 00aac53..d8c7d39 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,7 @@ __pycache__/
+ *.pyc
+ .venv/
+ .env
++.pytest_cache/
+ projects/*
+ !projects/.gitkeep
+ .DS_Store
+diff --git a/Dockerfile b/Dockerfile
+index 1b5c20d..b676a2c 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,2 +1,17 @@
+-# Host-side API image is intentionally separate from the render sandbox.
+-# Build the sandbox with: docker build -t ai-video-sandbox:latest ./sandbox
++# Host-side API image. The render sandbox is a separate image, build it with:
++#   docker build -t ai-video-sandbox:latest ./sandbox
++FROM python:3.12-slim
++
++ENV PYTHONUNBUFFERED=1
++
++# Docker CLI only: the daemon is the host's, reached through the mounted socket.
++COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
++
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY app ./app
++
++EXPOSE 8000
++# 0.0.0.0 inside the container; docker-compose publishes it on the host's loopback only.
++CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/Makefile b/Makefile
+index 946a24f..22ebe99 100644
+--- a/Makefile
++++ b/Makefile
+@@ -6,3 +6,6 @@ run-api:
+ 
+ health:
+ 	curl http://127.0.0.1:8000/health
++
++test:
++	python -m pytest -q
+diff --git a/README.md b/README.md
+index f58e83ebf6d1fe439a920150e7a453f6a79cf122..61b4c6a5cef397d8376e383e534c48e07065e8ae 100644
+GIT binary patch
+delta 1144
+zcmZ`&!EVz)5It1_bL0m`=>ZzWc3M>eg;J?dREmUBr4iTe+B=T7v3K3wb<>=D=gO6j
+zK;kp_CM0IpX-XxKBRSd~&wKOUn_qih4}Sc9(xrt|yh`fkFk*~F(Rl$JY>o;+Dqz-W
+zv(7X(BDuC&F(|nOHc;Fc?xa?O2@H-3S>bWA;<p1f0#|Ye+k40>*?_cA%R3a*(rKzd
+z_<V5))^XE0sTM$A_`?AE!iEbvku@eje3af0GFYHNm7{$C7y(ynU|Ya+=!r1!oGfsI
+z&{TX)&>7E{K<MFJ7+nX*i6`L_m=k=%7f9%OMROnVR!Du!04uCfxxSUs4h-hn2o%ZB
+zou}WQb<yrF%vz=V7%S;Y5ISF?iE~{y+F}&>&L<b=kaGpRvKmaQytEv0tsIvMO#<&Q
+z=dHy+=`=I|!LioLR}&=_Zc1&P7nqddN@V&D>aMj8GO0vd>sIwL4t?E_#vwMk0M;0N
+zjk&WaOW+b6Ncz!;2`bWw?DWJktE<*|4O}^id=xTn%jo0ua(;C&n|}K6ettEZPUmma
+z`_j~xrk&I27b#H3XB3$}6LETv*hh*KP>{8<5|6mcn)HU3tmaGXuj9>FY>zmJAQbE6
+zB&~v+&^8dqp%)E9jk};N<*RA4O4^c)Cb8K5!K-9U&;I1~csyowR;@>n{iX6&{9sH-
+z!Gj@>6i*`W@f@wQ55hD))yleW!=2|{EbumQcP?tyt|a)l2Kq-IKzy^60Q`Zacu<~c
+zL6DekoYscIaAx!kEOFgOky0)w>W1Q26m^4(G~{v9!>8IVWz+bLDxhP14fA{En|ors
+zswks@`bpu?kaB`HRxP4vhW|5TMNZ)@6|;>KDTBP^YC)^?Z=>Fjr6UBNxJ}BdiWWFG
+SvY}y#2xWsxXu*TsN%RMk|BZhD
+
+delta 64
+zcmeA&I<2|kF9(NSZh;9`LPEl3Q?5DOTFMLx3}FnJ3@Hq$4EYSY4DLWW4~UBx5*bQ>
+O;`u<HE(0$E7Xtt{bPiDf
+
+diff --git a/app/agent.py b/app/agent.py
+index 7964756..52b23e0 100644
+--- a/app/agent.py
++++ b/app/agent.py
+@@ -26,6 +26,9 @@ Rules:
+ 14. Do not assume remote internet assets exist because the renderer has no network.
+ 15. The project is intended for deterministic browser rendering, not interactive user presentation.
+ 16. Do not execute arbitrary host commands. Only use the provided tools.
++17. The page is recorded in real time starting at page load, and the video length is the sum of the storyboard scene durations. Your animation timeline must therefore start at load and run for that long (CSS animations or timers). window.__VIDEO_EXPORT__, window.__VIDEO_FPS__ and window.__VIDEO_TOTAL__ are defined before your scripts run.
++18. Audio playing in the page is NOT recorded. To add narration, call generate_narration and set "narration": "<file>.wav" on the scene in the storyboard; the compiler mixes that clip in at the scene's start time. Do not rely on <audio> elements.
++19. fetch() cannot read file:// URLs in Chromium, so inline small data into your JS instead of fetching local data files.
+ 
+ Create polished explainer-style videos. Use actual HTML/CSS/JS rather than placeholder text.
+ """
+@@ -142,7 +145,14 @@ def _tool_schemas():
+         }
+     ]
+ 
+-def _call_tool(project_id, name, args):
++def _path_was_supplied_by_user(source_path, supplied_text: str) -> bool:
++    """True if the user's own text (project prompt / instruction) contains this exact path."""
++    p = str(source_path or "").strip()
++    if not p:
++        return False
++    return p in supplied_text or p.replace("\\", "/") in supplied_text.replace("\\", "/")
++
++def _call_tool(project_id, name, args, supplied_text=""):
+     if name == "write_storyboard":
+         return write_storyboard(project_id, args["storyboard"])
+     if name == "write_source":
+@@ -150,14 +160,25 @@ def _call_tool(project_id, name, args):
+     if name == "save_text_asset":
+         return save_text_asset(project_id, args["asset_type"], args["filename"], args["content"])
+     if name == "generate_narration":
++        rate = args.get("rate")
++        volume = args.get("volume")
+         return generate_narration(
+             project_id,
+             args["filename"],
+             args["text"],
+-            int(args.get("rate", 170)),
+-            float(args.get("volume", 1.0)),
++            170 if rate is None else int(rate),
++            1.0 if volume is None else float(volume),
+         )
+     if name == "ingest_host_asset":
++        # The model must not be able to pull arbitrary files off the host (e.g. after a
++        # prompt injection). Only a path the user typed themselves is allowed; uploads
++        # made through the UI/CLI are already in the project.
++        if not _path_was_supplied_by_user(args.get("source_path"), supplied_text):
++            raise PermissionError(
++                "source_path was not supplied by the user. Only use a path exactly as the user "
++                "wrote it in their request, or ask them to attach the file in the UI / "
++                "`cli.py add-asset`."
++            )
+         return ingest_host_asset(
+             project_id,
+             args["asset_type"],
+@@ -168,7 +189,7 @@ def _call_tool(project_id, name, args):
+         return validate(project_id)
+     if name == "render_video":
+         return render(project_id, int(args["width"]), int(args["height"]), int(args["fps"]))
+-    raise ValueError(name)
++    raise ValueError(f"Unknown tool: {name}")
+ 
+ def run_agent(project_id: str, instruction: str | None = None):
+     if not GROQ_API_KEY:
+@@ -192,6 +213,8 @@ def run_agent(project_id: str, instruction: str | None = None):
+         {"role": "system", "content": SYSTEM},
+         {"role": "user", "content": json.dumps(user_message, indent=2)},
+     ]
++    # Text the user wrote themselves: the only place a host path may come from.
++    supplied_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
+ 
+     for _ in range(30):
+         response = client.chat.completions.create(
+@@ -223,8 +246,13 @@ def run_agent(project_id: str, instruction: str | None = None):
+ 
+         for tc in msg.tool_calls:
+             try:
+-                args = json.loads(tc.function.arguments)
+-                result = _call_tool(project_id, tc.function.name, args)
++                # Tools without parameters (validate_project) are often called with an
++                # empty string instead of "{}".
++                raw_args = tc.function.arguments
++                args = json.loads(raw_args) if raw_args and raw_args.strip() else {}
++                if not isinstance(args, dict):
++                    raise ValueError("Tool arguments must be a JSON object.")
++                result = _call_tool(project_id, tc.function.name, args, supplied_text)
+                 tool_output = {"ok": True, "result": result}
+             except Exception as exc:
+                 tool_output = {"ok": False, "error": str(exc)}
+diff --git a/app/config.py b/app/config.py
+index 64ee325..245cfd2 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -6,7 +6,17 @@ load_dotenv()
+ 
+ BASE_DIR = Path(__file__).resolve().parent.parent
+ 
+-PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", str(BASE_DIR / "projects"))).resolve()
++# A relative PROJECT_ROOT (e.g. "./projects" from .env.example) is resolved against the
++# repository, not the current working directory, so the API, the CLI and scripts run
++# from other directories all see the same projects.
++_project_root = Path(os.getenv("PROJECT_ROOT") or (BASE_DIR / "projects")).expanduser()
++if not _project_root.is_absolute():
++    _project_root = BASE_DIR / _project_root
++PROJECT_ROOT = _project_root.resolve()
++
++# Only needed when the API itself runs inside a container (docker-compose): the Docker
++# daemon lives on the host, so sandbox bind mounts must use the *host* path of PROJECT_ROOT.
++HOST_PROJECT_ROOT = os.getenv("HOST_PROJECT_ROOT", "").strip()
+ 
+ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+diff --git a/app/docker_runner.py b/app/docker_runner.py
+index 69d9d65..8689237 100644
+--- a/app/docker_runner.py
++++ b/app/docker_runner.py
+@@ -1,21 +1,55 @@
+ from pathlib import Path
+-import os
+ import subprocess
+-import tempfile
+-from .config import SANDBOX_IMAGE, SANDBOX_MEMORY, SANDBOX_CPUS, SANDBOX_PIDS_LIMIT, SANDBOX_TIMEOUT_SECONDS
++import uuid
++from .config import (
++    SANDBOX_IMAGE,
++    SANDBOX_MEMORY,
++    SANDBOX_CPUS,
++    SANDBOX_PIDS_LIMIT,
++    SANDBOX_TIMEOUT_SECONDS,
++    HOST_PROJECT_ROOT,
++)
+ from .project import project_dir
+ 
+ class DockerError(RuntimeError):
+     pass
+ 
++def _tail(text: str, limit: int = 4000) -> str:
++    """Keep error output short: it is shown to the user and fed back to the LLM."""
++    text = text or ""
++    return text if len(text) <= limit else "...[truncated]...\n" + text[-limit:]
++
++def _mount_source(project_id: str, root: Path) -> str:
++    # When the API runs in a container, `root` only exists inside that container, but the
++    # Docker daemon resolves bind-mount paths on the host.
++    if HOST_PROJECT_ROOT:
++        return HOST_PROJECT_ROOT.rstrip("/\\") + "/" + project_id
++    return str(root)
++
++def _hint(stderr: str) -> str:
++    daemon_down = (
++        "Cannot connect to the Docker daemon",  # older CLIs
++        "error during connect",                 # older Docker Desktop on Windows
++        "failed to connect to the docker API",  # current CLIs (Linux socket and Windows pipe)
++    )
++    if any(marker in stderr for marker in daemon_down):
++        return "\nHint: the Docker daemon is not reachable. Is Docker Desktop / the Docker service running?"
++    if "Unable to find image" in stderr or "pull access denied" in stderr or "No such image" in stderr:
++        return f"\nHint: build the sandbox image first: docker build -t {SANDBOX_IMAGE} ./sandbox"
++    return ""
++
+ def run_in_sandbox(project_id: str, command: list[str], output_name: str | None = None):
+     root = project_dir(project_id)
+     if not root.exists():
+         raise FileNotFoundError(project_id)
+ 
++    # A name lets us kill the container if the timeout fires.
++    name = f"aivideo-{uuid.uuid4().hex[:12]}"
++
+     # The container gets only the project workspace. It does not get the Docker socket.
+     docker_cmd = [
+         "docker", "run", "--rm",
++        "--name", name,
+         "--memory", SANDBOX_MEMORY,
+         "--cpus", SANDBOX_CPUS,
+         "--pids-limit", str(SANDBOX_PIDS_LIMIT),
+@@ -24,7 +58,10 @@ def run_in_sandbox(project_id: str, command: list[str], output_name: str | None
+         "--security-opt", "no-new-privileges",
+         "--read-only",
+         "--tmpfs", "/tmp:rw,noexec,nosuid,size=1g",
+-        "-v", f"{root}:/workspace:rw",
++        # With a read-only root filesystem, HOME must point at the tmpfs or Chromium and
++        # fontconfig have nowhere to write their caches.
++        "-e", "HOME=/tmp",
++        "-v", f"{_mount_source(project_id, root)}:/workspace:rw",
+         SANDBOX_IMAGE,
+         *command,
+     ]
+@@ -38,18 +75,25 @@ def run_in_sandbox(project_id: str, command: list[str], output_name: str | None
+             check=False,
+         )
+     except subprocess.TimeoutExpired as exc:
+-        raise DockerError("Sandbox timed out.") from exc
++        # subprocess only kills the `docker run` client; the container would keep running
++        # (and eating CPU/RAM) without this.
++        try:
++            subprocess.run(["docker", "kill", name], capture_output=True, check=False, timeout=30)
++        except (OSError, subprocess.SubprocessError):
++            pass
++        raise DockerError(f"Sandbox timed out after {SANDBOX_TIMEOUT_SECONDS}s and was killed.") from exc
+     except FileNotFoundError as exc:
+         raise DockerError("Docker executable was not found on PATH.") from exc
+ 
+     if completed.returncode != 0:
+         raise DockerError(
+             f"Sandbox failed with code {completed.returncode}\n"
+-            f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
++            f"STDOUT:\n{_tail(completed.stdout)}\nSTDERR:\n{_tail(completed.stderr)}"
++            f"{_hint(completed.stderr)}"
+         )
+ 
+     return {
+         "stdout": completed.stdout,
+         "stderr": completed.stderr,
+-        "output": str(project_dir(project_id) / output_name) if output_name else None,
++        "output": str(root / output_name) if output_name else None,
+     }
+diff --git a/app/main.py b/app/main.py
+index 1d3e2e4..e770211 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,4 +1,5 @@
+ from pathlib import Path
++import tempfile
+ 
+ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+ from fastapi.responses import FileResponse
+@@ -6,14 +7,24 @@ from fastapi.staticfiles import StaticFiles
+ 
+ from .models import ProjectCreate, AgentRequest, RenderRequest
+ from .project import create_project, load_project, project_dir
+-from .config import PROJECT_ROOT
++from .config import PROJECT_ROOT, MAX_FILE_BYTES
+ from .agent import run_agent
+-from .tools import validate, render, ingest_host_asset
++from .tools import validate, render, ingest_host_asset, ValidationFailed, CATEGORY_EXTENSIONS
+ 
+ app = FastAPI(title="AI Video Compiler", version="0.2.0")
+ STATIC_DIR = Path(__file__).parent / "static"
+ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+ 
++def _http_error(exc: Exception) -> HTTPException:
++    """Map domain errors to meaningful status codes instead of a blanket 500."""
++    if isinstance(exc, FileNotFoundError):
++        return HTTPException(status_code=404, detail="Project not found.")
++    if isinstance(exc, ValidationFailed):
++        return HTTPException(status_code=422, detail=str(exc))
++    if isinstance(exc, ValueError):
++        return HTTPException(status_code=400, detail=str(exc))
++    return HTTPException(status_code=500, detail=str(exc))
++
+ @app.get("/")
+ def frontend():
+     return FileResponse(STATIC_DIR / "index.html")
+@@ -47,32 +58,42 @@ def get_project(project_id: str):
+         raise HTTPException(status_code=404, detail="Project not found.")
+ 
+ @app.post("/projects/{project_id}/agent")
+-def agent(project_id: str, req: AgentRequest):
++def agent(project_id: str, req: AgentRequest | None = None):
+     try:
+-        return run_agent(project_id, req.instruction)
++        return run_agent(project_id, req.instruction if req else None)
+     except Exception as exc:
+-        raise HTTPException(status_code=500, detail=str(exc))
++        raise _http_error(exc)
+ 
+ @app.post("/projects/{project_id}/validate")
+ def validate_endpoint(project_id: str):
+     try:
+         return validate(project_id)
+     except Exception as exc:
+-        raise HTTPException(status_code=500, detail=str(exc))
++        raise _http_error(exc)
+ 
+ @app.post("/projects/{project_id}/render")
+-def render_endpoint(project_id: str, req: RenderRequest):
++def render_endpoint(project_id: str, req: RenderRequest | None = None):
++    req = req or RenderRequest()
+     try:
+         return render(project_id, req.width, req.height, req.fps)
+     except Exception as exc:
+-        raise HTTPException(status_code=500, detail=str(exc))
++        raise _http_error(exc)
+ 
+ @app.get("/projects/{project_id}/video")
+ def project_video(project_id: str):
+-    path = project_dir(project_id) / "renders" / "final" / "final.mp4"
++    try:
++        path = project_dir(project_id) / "renders" / "final" / "final.mp4"
++    except FileNotFoundError:
++        raise HTTPException(status_code=404, detail="Project not found.")
+     if not path.is_file():
+         raise HTTPException(status_code=404, detail="Rendered video not found.")
+-    return FileResponse(path, media_type="video/mp4", filename="final.mp4")
++    # no-store: a re-render replaces the file at the same URL.
++    return FileResponse(
++        path,
++        media_type="video/mp4",
++        filename="final.mp4",
++        headers={"Cache-Control": "no-store"},
++    )
+ 
+ @app.post("/projects/{project_id}/assets")
+ async def upload_asset(
+@@ -80,26 +101,33 @@ async def upload_asset(
+     asset_type: str = Form(...),
+     file: UploadFile = File(...),
+ ):
++    # Check the project first: otherwise a bogus id would create stray directories.
++    try:
++        load_project(project_id)
++    except FileNotFoundError:
++        raise HTTPException(status_code=404, detail="Project not found.")
++
+     suffix = Path(file.filename or "").suffix.lower()
+-    allowed = {
+-        "image": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"},
+-        "video": {".mp4", ".webm", ".mov"},
+-        "audio": {".wav", ".mp3", ".ogg", ".m4a"},
+-        "font": {".ttf", ".otf", ".woff", ".woff2"},
+-        "model3d": {".glb", ".gltf", ".obj", ".fbx"},
+-        "data": {".json", ".csv", ".txt"},
+-    }
+-    if asset_type not in allowed or suffix not in allowed[asset_type]:
++    if asset_type not in CATEGORY_EXTENSIONS or suffix not in CATEGORY_EXTENSIONS[asset_type]:
+         raise HTTPException(status_code=400, detail="Unsupported asset type or extension.")
+ 
+-    import tempfile
+-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+-        temp_path = Path(tmp.name)
+-        total = 0
+-        while chunk := await file.read(1024 * 1024):
+-            total += len(chunk)
+-            tmp.write(chunk)
++    temp_path = None
+     try:
+-        return ingest_host_asset(project_id, asset_type, str(temp_path), file.filename)
++        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
++            temp_path = Path(tmp.name)
++            total = 0
++            while chunk := await file.read(1024 * 1024):
++                total += len(chunk)
++                if total > MAX_FILE_BYTES:
++                    raise HTTPException(
++                        status_code=413,
++                        detail=f"File exceeds the {MAX_FILE_BYTES // (1024 * 1024)} MB limit.",
++                    )
++                tmp.write(chunk)
++        try:
++            return ingest_host_asset(project_id, asset_type, str(temp_path), file.filename)
++        except Exception as exc:
++            raise _http_error(exc)
+     finally:
+-        temp_path.unlink(missing_ok=True)
++        if temp_path is not None:
++            temp_path.unlink(missing_ok=True)
+diff --git a/app/models.py b/app/models.py
+index 9d67791..8e24892 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -1,5 +1,5 @@
+-from pydantic import BaseModel, Field
+-from typing import Literal, Optional
++from pydantic import BaseModel, Field, field_validator
++from typing import Optional
+ 
+ class ProjectCreate(BaseModel):
+     prompt: str = Field(min_length=1)
+@@ -8,9 +8,17 @@ class AgentRequest(BaseModel):
+     instruction: Optional[str] = None
+ 
+ class RenderRequest(BaseModel):
+-    width: int = 1920
+-    height: int = 1080
+-    fps: int = 30
++    width: int = Field(1920, ge=64, le=7680)
++    height: int = Field(1080, ge=64, le=4320)
++    fps: int = Field(30, ge=1, le=120)
++
++    @field_validator("width", "height")
++    @classmethod
++    def _even(cls, v: int) -> int:
++        # H.264 with yuv420p (needed for broad player support) requires even dimensions.
++        if v % 2:
++            raise ValueError("must be an even number")
++        return v
+ 
+ class ToolResult(BaseModel):
+     ok: bool
+diff --git a/app/project.py b/app/project.py
+index 908c399..ef5ebb9 100644
+--- a/app/project.py
++++ b/app/project.py
+@@ -1,9 +1,14 @@
+ from pathlib import Path
+ import json
++import re
+ import uuid
+ from datetime import datetime, timezone
+ from .config import PROJECT_ROOT
+ 
++# Project ids are always uuid4().hex. Anything else (".." etc.) is rejected so a crafted
++# id can never point outside PROJECT_ROOT.
++_PROJECT_ID_RE = re.compile(r"[0-9a-f]{32}")
++
+ DIRS = (
+     "source",
+     "source/scenes",
+@@ -22,8 +27,20 @@ def now():
+     return datetime.now(timezone.utc).isoformat()
+ 
+ def project_dir(project_id: str) -> Path:
++    if not isinstance(project_id, str) or not _PROJECT_ID_RE.fullmatch(project_id):
++        raise FileNotFoundError(project_id)
+     return PROJECT_ROOT / project_id
+ 
++def require_project_dir(project_id: str) -> Path:
++    """Like project_dir, but also requires the project to actually exist.
++
++    Write paths must use this so a bogus id can't create stray directories.
++    """
++    root = project_dir(project_id)
++    if not (root / "project.json").is_file():
++        raise FileNotFoundError(project_id)
++    return root
++
+ def create_project(prompt: str) -> dict:
+     project_id = uuid.uuid4().hex
+     root = project_dir(project_id)
+@@ -68,4 +85,4 @@ def save_project(manifest: dict):
+ 
+ def list_files(project_id: str):
+     root = project_dir(project_id)
+-    return [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()]
++    return [p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()]
+diff --git a/app/static/app.js b/app/static/app.js
+index d8412f9..dec0c3f 100644
+--- a/app/static/app.js
++++ b/app/static/app.js
+@@ -4,15 +4,16 @@ const chat=$('#chat'), prompt=$('#prompt');
+ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
+ function addMessage(role,text){if(chat.querySelector('.empty')) chat.innerHTML='';const el=document.createElement('div');el.className=`message ${role}`;el.innerHTML=`<div class="avatar">${role==='user'?'U':'AI'}</div><div class="bubble">${esc(text)}</div>`;chat.appendChild(el);chat.scrollTop=chat.scrollHeight;return el}
+ function setBusy(v){$('#sendBtn').disabled=v;prompt.disabled=v;$('#renderBtn').disabled=v||!state.project;$('#validateBtn').disabled=v||!state.project}
++function hideVideo(){const v=$('#video');v.pause();v.removeAttribute('src');v.load();$('#videoPanel').classList.add('hidden')}
+ function showEmpty(){chat.innerHTML='<div class="empty"><div><h1>Create a video</h1><p>Describe the video in natural language. The agent will turn your idea into a storyboard, HTML/CSS/JS scenes, narration and a rendered MP4.</p></div></div>'}
+ async function api(url,opt={}){const r=await fetch(url,opt);let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.detail||`Request failed (${r.status})`);return d}
+ async function loadProjects(){state.projects=await api('/projects');const list=$('#projectList');list.innerHTML=state.projects.map(p=>`<div class="project-item ${state.project?.id===p.id?'active':''}" data-id="${p.id}"><div class="project-name">${esc(p.prompt||'Untitled video')}</div><div class="project-date">${new Date(p.updated_at).toLocaleString()}</div></div>`).join('');list.querySelectorAll('.project-item').forEach(x=>x.onclick=()=>openProject(x.dataset.id))}
+-async function openProject(id){state.project=await api(`/projects/${id}`);state.files=[];$('#projectTitle').textContent=state.project.prompt||'Video project';$('#projectMeta').textContent=`Project ${id.slice(0,8)} · ${state.project.settings.width}×${state.project.settings.height}`;$('#renderBtn').disabled=false;$('#validateBtn').disabled=false;showEmpty();addMessage('assistant',`Project loaded. Tell me what to create or change.`);await loadProjects()}
+-async function newProject(){const text=prompt.value.trim()||'New video project';state.project=await api('/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text})});prompt.value='';state.files=[];$('#projectTitle').textContent='New video';$('#projectMeta').textContent='Describe what you want to create';showEmpty();$('#renderBtn').disabled=false;$('#validateBtn').disabled=false;await loadProjects()}
++async function openProject(id){state.project=await api(`/projects/${id}`);state.files=[];$('#projectTitle').textContent=state.project.prompt||'Video project';$('#projectMeta').textContent=`Project ${id.slice(0,8)} · ${state.project.settings.width}×${state.project.settings.height}`;$('#renderBtn').disabled=false;$('#validateBtn').disabled=false;hideVideo();showEmpty();addMessage('assistant',`Project loaded. Tell me what to create or change.`);await loadProjects()}
++async function newProject(){const text=prompt.value.trim()||'New video project';state.project=await api('/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text})});prompt.value='';state.files=[];$('#projectTitle').textContent='New video';$('#projectMeta').textContent='Describe what you want to create';hideVideo();showEmpty();$('#renderBtn').disabled=false;$('#validateBtn').disabled=false;await loadProjects()}
+ function renderFiles(){const a=$('#attachments');a.innerHTML=state.files.map(f=>`<span class="chip">📎 ${esc(f.name)}</span>`).join('')}
+ async function uploadFiles(){for(const f of state.files){const fd=new FormData();fd.append('asset_type',guessType(f));fd.append('file',f);await api(`/projects/${state.project.id}/assets`,{method:'POST',body:fd})}}
+ function guessType(f){const n=f.name.toLowerCase(),e=n.includes('.')?'.'+n.split('.').pop():'';if(f.type.startsWith('image/')||['.svg'].includes(e))return'image';if(f.type.startsWith('video/'))return'video';if(f.type.startsWith('audio/'))return'audio';if(['.ttf','.otf','.woff','.woff2'].includes(e))return'font';if(['.glb','.gltf','.obj','.fbx'].includes(e))return'model3d';return'data'}
+ async function send(){const text=prompt.value.trim();if(!text&&!state.files.length)return;if(!state.project){await newProject()}if(text)addMessage('user',text);if(state.files.length){addMessage('user',`Attached ${state.files.length} file(s): ${state.files.map(x=>x.name).join(', ')}`)}const files=state.files.slice();state.files=[];renderFiles();prompt.value='';setBusy(true);const typing=addMessage('assistant','Working on your video…');try{if(files.length){state.files=files;await uploadFiles();state.files=[]}const result=await api(`/projects/${state.project.id}/agent`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:text||'Use the attached assets in the video project.'})});typing.remove();addMessage('assistant',result.message||'Generation complete. Validate or render the project.');await loadProjects()}catch(e){typing.remove();addMessage('assistant',`Error: ${e.message}`);setBusy(false)}setBusy(false)}
+-async function validate(){setBusy(true);try{const r=await api(`/projects/${state.project.id}/validate`,{method:'POST'});addMessage('assistant',r.ok?'Validation passed. The project is ready to render.':`Validation failed:\n${(r.errors||[]).join('\n')}`)}catch(e){addMessage('assistant',`Validation error: ${e.message}`)}finally{setBusy(false)}}
+-async function renderVideo(){setBusy(true);addMessage('assistant','Rendering Chromium capture and encoding the MP4…');try{const r=await api(`/projects/${state.project.id}/render`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({width:1920,height:1080,fps:30})});if(r.output){const src=`/projects/${state.project.id}/render-file?path=${encodeURIComponent(r.output)}`;$('#video').src=src;$('#downloadVideo').href=src;$('#videoPanel').classList.remove('hidden')}addMessage('assistant',r.message||'Render complete.')}catch(e){addMessage('assistant',`Render error: ${e.message}`)}finally{setBusy(false)}}
++async function validate(){setBusy(true);try{const r=await api(`/projects/${state.project.id}/validate`,{method:'POST'});const warn=(r.warnings||[]).length?`\nWarnings:\n${r.warnings.join('\n')}`:'';addMessage('assistant',r.valid?`Validation passed.${warn||' The project is ready to render.'}`:`Validation failed:\n${(r.errors||[]).join('\n')}${warn}`)}catch(e){addMessage('assistant',`Validation error: ${e.message}`)}finally{setBusy(false)}}
++async function renderVideo(){setBusy(true);addMessage('assistant','Rendering Chromium capture and encoding the MP4…');try{const r=await api(`/projects/${state.project.id}/render`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({width:1920,height:1080,fps:30})});const src=`/projects/${state.project.id}/video?t=${Date.now()}`;$('#video').src=src;$('#downloadVideo').href=src;$('#videoPanel').classList.remove('hidden');addMessage('assistant',r.size_bytes?`Render complete (${(r.size_bytes/1048576).toFixed(1)} MB).`:'Render complete.')}catch(e){addMessage('assistant',`Render error: ${e.message}`)}finally{setBusy(false)}}
+ $('#sendBtn').onclick=send;$('#newProject').onclick=newProject;$('#validateBtn').onclick=validate;$('#renderBtn').onclick=renderVideo;$('#attachBtn').onclick=()=>$('#fileInput').click();$('#fileInput').onchange=e=>{state.files=[...state.files,...e.target.files];renderFiles();e.target.value=''};$('#closeVideo').onclick=()=>$('#videoPanel').classList.add('hidden');prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});prompt.addEventListener('input',()=>{prompt.style.height='auto';prompt.style.height=Math.min(prompt.scrollHeight,180)+'px'});showEmpty();loadProjects();
+diff --git a/app/tools.py b/app/tools.py
+index 223b3a2..292ef46 100644
+--- a/app/tools.py
++++ b/app/tools.py
+@@ -1,7 +1,9 @@
+ from pathlib import Path
++import json
+ import mimetypes
+ import shutil
+-from .project import project_dir, load_project, save_project
++from .config import MAX_FILE_BYTES
++from .project import require_project_dir, load_project, save_project
+ from .validation import validate_project
+ from .docker_runner import run_in_sandbox
+ 
+@@ -25,6 +27,16 @@ CATEGORY_EXTENSIONS = {
+     "data": {".json", ".csv", ".txt"},
+ }
+ 
++# Text saved as a "narration" asset is the script, not audio (audio comes from generate_narration).
++NARRATION_TEXT_EXTENSIONS = {".txt"}
++
++class ValidationFailed(ValueError):
++    """Raised by render() when the project does not pass validation."""
++
++    def __init__(self, errors: list[str]):
++        self.errors = errors
++        super().__init__("Project validation failed: " + "; ".join(errors))
++
+ def _safe_name(name: str) -> str:
+     name = Path(name).name
+     if not name or name in {".", ".."}:
+@@ -32,42 +44,66 @@ def _safe_name(name: str) -> str:
+     return name
+ 
+ def write_source(project_id: str, relative_path: str, content: str):
+-    root = project_dir(project_id)
++    root = require_project_dir(project_id)
+     p = Path(relative_path)
+-    if p.is_absolute() or ".." in p.parts:
++    # p.drive/p.root also catch Windows forms like "C:evil.js" or "\evil.js" that
++    # is_absolute() reports as relative but that replace the base when joined.
++    if p.is_absolute() or p.drive or p.root or ".." in p.parts:
+         raise ValueError("Path traversal is not allowed.")
+     if p.suffix.lower() not in {".html", ".css", ".js", ".mjs", ".json", ".txt"}:
+         raise ValueError("Unsupported source extension.")
+-    target = root / "source" / p
++    source_root = (root / "source").resolve()
++    target = (source_root / p).resolve()
++    if not target.is_relative_to(source_root):
++        raise ValueError("Path traversal is not allowed.")
+     target.parent.mkdir(parents=True, exist_ok=True)
+     target.write_text(content, encoding="utf-8")
+-    return {"path": str(target.relative_to(root))}
++    return {"path": target.relative_to(root.resolve()).as_posix()}
+ 
+ def write_storyboard(project_id: str, storyboard: dict):
+-    if not isinstance(storyboard.get("scenes"), list) or not storyboard["scenes"]:
+-        raise ValueError("Storyboard must contain a non-empty scenes list.")
+-    root = project_dir(project_id)
+-    (root / "storyboard.json").write_text(
+-        __import__("json").dumps(storyboard, indent=2), encoding="utf-8"
+-    )
++    # Some models send the object as a JSON string.
++    if isinstance(storyboard, str):
++        try:
++            storyboard = json.loads(storyboard)
++        except json.JSONDecodeError as exc:
++            raise ValueError(f"storyboard must be a JSON object: {exc}") from exc
++    if (
++        not isinstance(storyboard, dict)
++        or not isinstance(storyboard.get("scenes"), list)
++        or not storyboard["scenes"]
++    ):
++        raise ValueError("Storyboard must be an object containing a non-empty scenes list.")
++    root = require_project_dir(project_id)
++    (root / "storyboard.json").write_text(json.dumps(storyboard, indent=2), encoding="utf-8")
+     manifest = load_project(project_id)
+     manifest["scenes"] = storyboard["scenes"]
+     save_project(manifest)
+     return {"path": "storyboard.json"}
+ 
+ def save_text_asset(project_id: str, asset_type: str, filename: str, content: str):
+-    if asset_type not in CATEGORY_DIRS:
++    if asset_type == "narration":
++        allowed = NARRATION_TEXT_EXTENSIONS
++    elif asset_type in CATEGORY_EXTENSIONS:
++        allowed = CATEGORY_EXTENSIONS[asset_type]
++    else:
+         raise ValueError(f"Unsupported asset type: {asset_type}")
+     filename = _safe_name(filename)
+-    root = project_dir(project_id)
++    if Path(filename).suffix.lower() not in allowed:
++        raise ValueError(
++            f"{filename} is not an allowed {asset_type} file (allowed: {', '.join(sorted(allowed))})."
++        )
++    if len(content.encode("utf-8")) > MAX_FILE_BYTES:
++        raise ValueError("Content exceeds MAX_FILE_BYTES.")
++    root = require_project_dir(project_id)
+     target = root / CATEGORY_DIRS[asset_type] / filename
+     target.parent.mkdir(parents=True, exist_ok=True)
+     target.write_text(content, encoding="utf-8")
+-    return {"path": str(target.relative_to(root))}
++    return {"path": target.relative_to(root).as_posix()}
+ 
+ def ingest_host_asset(project_id: str, asset_type: str, source_path: str, filename: str | None = None):
+     if asset_type not in CATEGORY_EXTENSIONS:
+         raise ValueError(f"Unsupported binary asset type: {asset_type}")
++    root = require_project_dir(project_id)
+     source = Path(source_path).expanduser().resolve()
+     if not source.is_file():
+         raise FileNotFoundError(str(source))
+@@ -75,52 +111,77 @@ def ingest_host_asset(project_id: str, asset_type: str, source_path: str, filena
+     suffix = Path(name).suffix.lower()
+     if suffix not in CATEGORY_EXTENSIONS[asset_type]:
+         raise ValueError(f"{name} is not an allowed {asset_type} file.")
+-    root = project_dir(project_id)
++    if source.stat().st_size > MAX_FILE_BYTES:
++        raise ValueError(f"{name} exceeds the {MAX_FILE_BYTES} byte file limit.")
+     target = root / CATEGORY_DIRS[asset_type] / name
+     target.parent.mkdir(parents=True, exist_ok=True)
+     shutil.copy2(source, target)
+-    return {"path": str(target.relative_to(root)), "mime": mimetypes.guess_type(name)[0]}
++    return {"path": target.relative_to(root).as_posix(), "mime": mimetypes.guess_type(name)[0]}
+ 
+ def generate_narration(project_id: str, filename: str, text: str, rate: int = 170, volume: float = 1.0):
+     filename = _safe_name(filename)
+     if Path(filename).suffix.lower() != ".wav":
+         raise ValueError("Narration output must be .wav")
+-    root = project_dir(project_id)
++    if not text or not text.strip():
++        raise ValueError("Narration text is empty.")
++    rate = max(80, min(int(rate), 400))
++    volume = max(0.0, min(float(volume), 1.0))
++    root = require_project_dir(project_id)
++    (root / "narration").mkdir(parents=True, exist_ok=True)
+     text_path = root / "narration" / f"{Path(filename).stem}.txt"
+     text_path.write_text(text, encoding="utf-8")
++    audio_path = root / "narration" / filename
++    # Remove any previous file first so a stale clip can never be mistaken for fresh output.
++    audio_path.unlink(missing_ok=True)
++    # The text is passed as a file, not a CLI argument: that avoids command-line length
++    # limits and argparse treating text that starts with "-" as an option.
+     result = run_in_sandbox(
+         project_id,
+         [
+             "python", "/opt/renderer/tts.py",
+-            "--text", text,
++            "--text-file", f"/workspace/narration/{text_path.name}",
+             "--output", f"/workspace/narration/{filename}",
+             "--rate", str(rate),
+             "--volume", str(volume),
+         ],
+     )
+-    if not (root / "narration" / filename).exists():
+-        raise RuntimeError("TTS command returned but the narration file is missing.")
++    if not audio_path.exists() or audio_path.stat().st_size == 0:
++        raise RuntimeError("TTS command returned but the narration file is missing or empty.")
+     manifest = load_project(project_id)
+-    manifest["narration"].append({
++    entry = {
+         "filename": filename,
+-        "text_file": str(text_path.relative_to(root)),
++        "text_file": text_path.relative_to(root).as_posix(),
+         "audio_path": f"narration/{filename}",
+-    })
++    }
++    # Regenerating a clip replaces its entry instead of adding a duplicate.
++    manifest["narration"] = [
++        n for n in manifest.get("narration", []) if n.get("filename") != filename
++    ] + [entry]
+     save_project(manifest)
+     return {
+         "path": f"narration/{filename}",
+-        "text_path": str(text_path.relative_to(root)),
++        "text_path": entry["text_file"],
+         "stdout": result["stdout"],
+     }
+ 
+ def validate(project_id: str):
+     return validate_project(project_id)
+ 
++def check_render_params(width: int, height: int, fps: int):
++    if not (64 <= width <= 7680 and 64 <= height <= 4320):
++        raise ValueError("width and height must be between 64 and 7680x4320.")
++    if width % 2 or height % 2:
++        raise ValueError("width and height must be even numbers (required by H.264 yuv420p).")
++    if not 1 <= fps <= 120:
++        raise ValueError("fps must be between 1 and 120.")
++
+ def render(project_id: str, width: int, height: int, fps: int):
+-    validation = validate_project(project_id)
++    check_render_params(width, height, fps)
++    validation = validate_project(project_id, require_renderable=True)
+     if not validation["valid"]:
+-        raise ValueError(__import__("json").dumps(validation, indent=2))
+-    return run_in_sandbox(
++        raise ValidationFailed(validation["errors"])
++    root = require_project_dir(project_id)
++    result = run_in_sandbox(
+         project_id,
+         [
+             "python", "/opt/renderer/render.py",
+@@ -131,3 +192,9 @@ def render(project_id: str, width: int, height: int, fps: int):
+         ],
+         output_name="renders/final/final.mp4",
+     )
++    video = root / "renders" / "final" / "final.mp4"
++    if not video.is_file():
++        raise RuntimeError("Render finished but renders/final/final.mp4 is missing.")
++    result["video_url"] = f"/projects/{project_id}/video"
++    result["size_bytes"] = video.stat().st_size
++    return result
+diff --git a/app/validation.py b/app/validation.py
+index 197143d..d53d8fa 100644
+--- a/app/validation.py
++++ b/app/validation.py
+@@ -1,7 +1,6 @@
+ from pathlib import Path
+ import json
+-import mimetypes
+-from .project import project_dir, load_project
++from .project import require_project_dir
+ from .config import MAX_PROJECT_BYTES, MAX_FILE_BYTES
+ 
+ ALLOWED = {
+@@ -15,19 +14,31 @@ ALLOWED = {
+ 
+ SOURCE_ALLOWED = {".html", ".css", ".js", ".mjs", ".json", ".txt"}
+ 
+-def validate_project(project_id: str) -> dict:
+-    root = project_dir(project_id)
+-    manifest = load_project(project_id)
++def validate_project(project_id: str, require_renderable: bool = False) -> dict:
++    """Check a project's files and storyboard.
++
++    With require_renderable=True (used right before rendering) a missing
++    source/index.html or storyboard.json is an error instead of a warning, so the
++    problem is reported before a Docker container is started.
++    """
++    root = require_project_dir(project_id)
+     errors = []
+     warnings = []
+ 
++    renders_root = root / "renders"
+     total = 0
+     for p in root.rglob("*"):
+-        if p.is_file():
+-            size = p.stat().st_size
+-            total += size
+-            if size > MAX_FILE_BYTES:
+-                errors.append(f"File exceeds MAX_FILE_BYTES: {p.relative_to(root)}")
++        if not p.is_file():
++            continue
++        # renders/ holds engine output (final.mp4 can legitimately be large); the size
++        # limits are for authored/uploaded input, otherwise one big render would make
++        # every later validation - and therefore every later render - fail.
++        if renders_root in p.parents:
++            continue
++        size = p.stat().st_size
++        total += size
++        if size > MAX_FILE_BYTES:
++            errors.append(f"File exceeds MAX_FILE_BYTES: {p.relative_to(root).as_posix()}")
+ 
+     if total > MAX_PROJECT_BYTES:
+         errors.append("Project exceeds MAX_PROJECT_BYTES.")
+@@ -37,30 +48,51 @@ def validate_project(project_id: str) -> dict:
+         for p in category_root.rglob("*"):
+             if p.is_file() and p.suffix.lower() not in extensions:
+                 errors.append(
+-                    f"Invalid {category} asset extension: {p.relative_to(root)}"
++                    f"Invalid {category} asset extension: {p.relative_to(root).as_posix()}"
+                 )
+ 
+     for p in (root / "source").rglob("*"):
+         if p.is_file() and p.suffix.lower() not in SOURCE_ALLOWED:
+-            errors.append(f"Unsupported source file: {p.relative_to(root)}")
++            errors.append(f"Unsupported source file: {p.relative_to(root).as_posix()}")
+ 
+     index = root / "source" / "index.html"
+     if not index.exists():
+-        warnings.append("source/index.html does not exist yet.")
++        if require_renderable:
++            errors.append("source/index.html is required to render.")
++        else:
++            warnings.append("source/index.html does not exist yet.")
+ 
+     storyboard = root / "storyboard.json"
+-    if storyboard.exists():
++    if not storyboard.exists():
++        if require_renderable:
++            errors.append("storyboard.json is required to render. Create it with write_storyboard.")
++        else:
++            warnings.append("storyboard.json does not exist yet.")
++    else:
+         try:
+             data = json.loads(storyboard.read_text(encoding="utf-8"))
+-            scenes = data.get("scenes", [])
+-            for i, scene in enumerate(scenes):
+-                if not scene.get("id"):
+-                    errors.append(f"Storyboard scene {i} has no id.")
+-                duration = scene.get("duration_seconds")
+-                if not isinstance(duration, (int, float)) or duration <= 0:
+-                    errors.append(f"Storyboard scene {i} has invalid duration_seconds.")
+         except json.JSONDecodeError as exc:
+             errors.append(f"Invalid storyboard.json: {exc}")
++        else:
++            scenes = data.get("scenes") if isinstance(data, dict) else None
++            if not isinstance(scenes, list) or not scenes:
++                errors.append("storyboard.json must be an object with a non-empty 'scenes' list.")
++            else:
++                for i, scene in enumerate(scenes):
++                    if not isinstance(scene, dict):
++                        errors.append(f"Storyboard scene {i} must be an object.")
++                        continue
++                    if not scene.get("id"):
++                        errors.append(f"Storyboard scene {i} has no id.")
++                    duration = scene.get("duration_seconds")
++                    # bool is a subclass of int; True would otherwise pass as 1 second.
++                    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
++                        errors.append(f"Storyboard scene {i} has invalid duration_seconds.")
++                    narration = scene.get("narration")
++                    if narration and not (root / "narration" / Path(str(narration)).name).is_file():
++                        errors.append(
++                            f"Storyboard scene {i} references missing narration file: {narration}"
++                        )
+ 
+     return {
+         "valid": not errors,
+diff --git a/docker-compose.yml b/docker-compose.yml
+index ee50030..eebd671 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -5,8 +5,15 @@ services:
+       dockerfile: Dockerfile
+     environment:
+       PROJECT_ROOT: /workspace/projects
++      # The Docker daemon runs on the host, so sandbox bind mounts must use the HOST path
++      # of ./projects, not /workspace/projects. Set it in .env (absolute path).
++      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:?Set HOST_PROJECT_ROOT in .env to the absolute host path of ./projects}
++      GROQ_API_KEY: ${GROQ_API_KEY:-}
++      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+     volumes:
+       - ./projects:/workspace/projects
+       - /var/run/docker.sock:/var/run/docker.sock
+     ports:
+-      - "8000:8000"
++      # Loopback only: this container can start containers on the host (Docker socket),
++      # so it must not be reachable from the network.
++      - "127.0.0.1:8000:8000"
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+index 0000000..2f21eed
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,3 @@
++-r requirements.txt
++pytest>=8.0
++httpx>=0.27
+diff --git a/sandbox/Dockerfile b/sandbox/Dockerfile
+index 3541b0b..8450c56 100644
+--- a/sandbox/Dockerfile
++++ b/sandbox/Dockerfile
+@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     chromium \
+     chromium-driver \
+     espeak-ng \
+-    libespeak1 \
++    libespeak-ng1 \
+     fonts-dejavu \
+     fonts-liberation \
+     fonts-noto \
+@@ -23,6 +23,11 @@ RUN pip install --no-cache-dir \
+     playwright \
+     pyttsx3
+ 
++# Chromium comes from apt (render.py passes executable_path), but Playwright's video
++# recording (record_video_dir) needs its own bundled ffmpeg build. Without this step every
++# render fails with "Executable doesn't exist at /ms-playwright/ffmpeg-...".
++RUN playwright install ffmpeg
++
+ COPY renderer /opt/renderer
+ RUN chmod +x /opt/renderer/*.py
+ 
+diff --git a/sandbox/renderer/render.py b/sandbox/renderer/render.py
+index 6b98f69..8b6baed 100644
+--- a/sandbox/renderer/render.py
++++ b/sandbox/renderer/render.py
+@@ -1,40 +1,146 @@
+ import argparse
+ import json
+ import subprocess
+-import sys
+ import time
++import wave
+ from pathlib import Path
+ 
+-from playwright.sync_api import sync_playwright
++# Extra seconds recorded after the storyboard ends so trimming to the exact length never
++# cuts the last frames short.
++TAIL_SECONDS = 0.5
++MAX_BROWSER_MESSAGES = 20
++
+ 
+ def load_storyboard(root: Path):
+     path = root / "storyboard.json"
+     if not path.exists():
+         raise RuntimeError("storyboard.json is required.")
+     data = json.loads(path.read_text(encoding="utf-8"))
+-    scenes = data.get("scenes")
+-    if not scenes:
++    scenes = data.get("scenes") if isinstance(data, dict) else None
++    if not isinstance(scenes, list) or not scenes:
+         raise RuntimeError("storyboard.json has no scenes.")
+     total = 0.0
+     for scene in scenes:
++        if not isinstance(scene, dict):
++            raise RuntimeError("Every storyboard scene must be an object.")
+         duration = float(scene["duration_seconds"])
+         if duration <= 0:
+             raise RuntimeError(f"Invalid duration for scene {scene.get('id')}.")
+         total += duration
+     return data, total
+ 
++
++def wav_duration(path: Path) -> float:
++    with wave.open(str(path), "rb") as w:
++        return w.getnframes() / float(w.getframerate())
++
++
++def plan_audio(project: Path, scenes):
++    """Decide which narration clips go into the video and when they start.
++
++    A scene can set "narration": "<file>.wav" and that clip starts with the scene. If no
++    scene references narration but narration/*.wav exist, the clips play back to back from
++    the start, in file-name order. Returns [(path, start_seconds), ...].
++    """
++    narration_dir = project / "narration"
++    available = {p.name: p for p in sorted(narration_dir.glob("*.wav"))} if narration_dir.is_dir() else {}
++    tracks = []
++    referenced = False
++    start = 0.0
++    for scene in scenes:
++        name = scene.get("narration")
++        if name:
++            referenced = True
++            clip = available.get(Path(str(name)).name)
++            if clip is None:
++                raise RuntimeError(f"Scene {scene.get('id')} references missing narration file: {name}")
++            tracks.append((clip, start))
++        start += float(scene["duration_seconds"])
++    if not referenced:
++        t = 0.0
++        for clip in available.values():
++            tracks.append((clip, t))
++            t += wav_duration(clip)
++    return tracks
++
++
++def build_ffmpeg_cmd(src: Path, dst: Path, fps: int, total: float, offset: float, tracks):
++    cmd = ["ffmpeg", "-y"]
++    if offset > 0:
++        # Input option: drops the blank lead-in before the page timeline began.
++        cmd += ["-ss", f"{offset:.3f}"]
++    cmd += ["-i", str(src)]
++    for clip, _ in tracks:
++        cmd += ["-i", str(clip)]
++
++    if tracks:
++        parts = []
++        for i, (_, start) in enumerate(tracks, start=1):
++            ms = int(round(start * 1000))
++            parts.append(
++                f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms}[a{i}]"
++            )
++        if len(tracks) > 1:
++            labels = "".join(f"[a{i}]" for i in range(1, len(tracks) + 1))
++            # normalize=0: otherwise amix divides every input's volume by the track count.
++            parts.append(f"{labels}amix=inputs={len(tracks)}:normalize=0:duration=longest[aout]")
++            audio_label = "[aout]"
++        else:
++            audio_label = "[a1]"
++        cmd += [
++            "-filter_complex", ";".join(parts),
++            "-map", "0:v:0", "-map", audio_label,
++            "-c:a", "aac", "-b:a", "192k",
++        ]
++    else:
++        cmd += ["-map", "0:v:0", "-an"]
++
++    cmd += [
++        "-c:v", "libx264",
++        "-preset", "medium",
++        "-crf", "18",
++        "-pix_fmt", "yuv420p",
++        "-r", str(fps),
++        "-t", f"{total:.3f}",
++        "-movflags", "+faststart",
++        str(dst),
++    ]
++    return cmd
++
++
++def encode(src: Path, dst: Path, fps: int, total: float, offset: float, tracks):
++    completed = subprocess.run(
++        build_ffmpeg_cmd(src, dst, fps, total, offset, tracks),
++        capture_output=True,
++        text=True,
++    )
++    if completed.returncode != 0:
++        raise RuntimeError(completed.stderr[-3000:])
++
++
+ def render(project: Path, width: int, height: int, fps: int):
++    # Imported here so the pure helpers above can be used (and tested) without Playwright.
++    from playwright.sync_api import sync_playwright
++
+     html = project / "source" / "index.html"
+     if not html.exists():
+         raise RuntimeError("source/index.html is missing.")
+ 
+     storyboard, total = load_storyboard(project)
++    tracks = plan_audio(project, storyboard["scenes"])
+ 
+     out_dir = project / "renders" / "final"
+     out_dir.mkdir(parents=True, exist_ok=True)
+-    webm = out_dir / "browser.webm"
+     mp4 = out_dir / "final.mp4"
+ 
++    # Surface what went wrong inside the page (blocked remote scripts, missing assets,
++    # JS errors) so a blank video can be diagnosed instead of silently "succeeding".
++    browser_messages = []
++
++    def note(kind, text):
++        if len(browser_messages) < MAX_BROWSER_MESSAGES:
++            browser_messages.append(f"{kind}: {str(text)[:300]}")
++
+     with sync_playwright() as p:
+         browser = p.chromium.launch(
+             executable_path="/usr/bin/chromium",
+@@ -43,6 +149,8 @@ def render(project: Path, width: int, height: int, fps: int):
+                 "--no-sandbox",
+                 "--disable-dev-shm-usage",
+                 "--disable-gpu",
++                # Needed for ES module scripts / XHR between local files under file://.
++                "--allow-file-access-from-files",
+             ],
+         )
+ 
+@@ -52,56 +160,60 @@ def render(project: Path, width: int, height: int, fps: int):
+             record_video_size={"width": width, "height": height},
+             device_scale_factor=1,
+         )
++        # Defined before any page script runs, so pages can read them at load time.
++        context.add_init_script(
++            script=(
++                "window.__VIDEO_EXPORT__ = true;"
++                f"window.__VIDEO_FPS__ = {int(fps)};"
++                f"window.__VIDEO_TOTAL__ = {float(total)};"
++            )
++        )
+ 
+         page = context.new_page()
++        t_page = time.monotonic()  # the recording starts with the page
++        page.on("console", lambda m: note("console.error", m.text) if m.type == "error" else None)
++        page.on("pageerror", lambda e: note("pageerror", e))
++        page.on("requestfailed", lambda r: note("requestfailed", f"{r.url} ({r.failure})"))
++
+         page.goto(html.as_uri(), wait_until="load")
+         page.wait_for_function("document.fonts ? document.fonts.status === 'loaded' : true")
+-        page.wait_for_timeout(500)
+-
+-        page.evaluate(
+-            """({fps, total}) => {
+-                window.__VIDEO_EXPORT__ = true;
+-                window.__VIDEO_FPS__ = fps;
+-                window.__VIDEO_TOTAL__ = total;
+-            }""",
+-            {"fps": fps, "total": total},
+-        )
+ 
+-        page.wait_for_timeout(int(total * 1000))
++        # performance.now() is the time since navigation began, i.e. how far into the
++        # page's own timeline we are. That pins down where the page timeline starts on
++        # the recording, so trimming and audio line up with the animations.
++        perf_now_ms = page.evaluate("performance.now()")
++        nav_start = time.monotonic() - perf_now_ms / 1000.0
++        remaining = (nav_start + total + TAIL_SECONDS) - time.monotonic()
++        page.wait_for_timeout(max(0, int(remaining * 1000)))
+ 
++        video_path = Path(page.video.path()) if page.video else None
+         context.close()
+         browser.close()
+ 
+-    # Playwright chooses the filename internally; locate the newest WebM.
+-    candidates = sorted(out_dir.glob("*.webm"), key=lambda p: p.stat().st_mtime, reverse=True)
+-    if not candidates:
+-        raise RuntimeError("Browser did not produce a WebM recording.")
+-    browser_video = candidates[0]
++    offset = nav_start - t_page
++    if not (0 <= offset <= 10):
++        offset = 0.0  # implausible measurement: don't trim at all
+ 
+-    cmd = [
+-        "ffmpeg", "-y",
+-        "-i", str(browser_video),
+-        "-c:v", "libx264",
+-        "-preset", "medium",
+-        "-crf", "18",
+-        "-pix_fmt", "yuv420p",
+-        "-r", str(fps),
+-        "-movflags", "+faststart",
+-        str(mp4),
+-    ]
+-    completed = subprocess.run(cmd, capture_output=True, text=True)
+-    if completed.returncode != 0:
+-        raise RuntimeError(completed.stderr)
++    if video_path is None or not video_path.exists():
++        # Fallback: newest WebM in the output directory.
++        candidates = sorted(out_dir.glob("*.webm"), key=lambda q: q.stat().st_mtime, reverse=True)
++        if not candidates:
++            raise RuntimeError("Browser did not produce a WebM recording.")
++        video_path = candidates[0]
+ 
+-    if browser_video != webm and browser_video.exists():
+-        browser_video.unlink()
++    encode(video_path, mp4, fps, total, offset, tracks)
++    video_path.unlink(missing_ok=True)
+ 
+     print(json.dumps({
+         "ok": True,
+         "duration_seconds": total,
+         "output": str(mp4),
++        "audio": [{"file": clip.name, "start_seconds": round(start, 3)} for clip, start in tracks],
++        "trim_offset_seconds": round(offset, 3),
++        "browser_messages": browser_messages,
+     }))
+ 
++
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--project", required=True)
+diff --git a/sandbox/renderer/tts.py b/sandbox/renderer/tts.py
+index 90b04b3..365cc9c 100644
+--- a/sandbox/renderer/tts.py
++++ b/sandbox/renderer/tts.py
+@@ -1,22 +1,38 @@
+ import argparse
+ from pathlib import Path
+-import pyttsx3
++
+ 
+ def synthesize(text: str, output: Path, rate: int = 170, volume: float = 1.0):
++    import pyttsx3  # imported lazily so argument handling can be tested without a speech engine
++
++    text = (text or "").strip()
++    if not text:
++        raise RuntimeError("Narration text is empty.")
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.unlink(missing_ok=True)  # a stale file must never pass the check below
++
+     engine = pyttsx3.init()
+     engine.setProperty("rate", rate)
+-    engine.setProperty("volume", volume)
+-    output.parent.mkdir(parents=True, exist_ok=True)
++    engine.setProperty("volume", max(0.0, min(volume, 1.0)))
+     engine.save_to_file(text, str(output))
+     engine.runAndWait()
+     if not output.exists() or output.stat().st_size == 0:
+         raise RuntimeError("TTS did not produce an audio file.")
+ 
+-if __name__ == "__main__":
++
++def parse_args(argv=None):
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--text", required=True)
++    source = parser.add_mutually_exclusive_group(required=True)
++    source.add_argument("--text")
++    # A file avoids command-line length limits and values that start with "-".
++    source.add_argument("--text-file")
+     parser.add_argument("--output", required=True)
+     parser.add_argument("--rate", type=int, default=170)
+     parser.add_argument("--volume", type=float, default=1.0)
+-    args = parser.parse_args()
+-    synthesize(args.text, Path(args.output), args.rate, args.volume)
++    return parser.parse_args(argv)
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    text = Path(args.text_file).read_text(encoding="utf-8") if args.text_file else args.text
++    synthesize(text, Path(args.output), args.rate, args.volume)
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..e7dba52
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,77 @@
++import os
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[1]
++
++# app.config reads these at import time, so they must be set before anything imports `app`.
++_TMP_ROOT = tempfile.mkdtemp(prefix="vg-tests-")
++os.environ["PROJECT_ROOT"] = _TMP_ROOT
++os.environ["GROQ_API_KEY"] = ""
++os.environ.pop("HOST_PROJECT_ROOT", None)
++
++sys.path.insert(0, str(REPO))
++
++
++def pytest_sessionfinish(session, exitstatus):
++    shutil.rmtree(_TMP_ROOT, ignore_errors=True)
++
++
++@pytest.fixture
++def project():
++    from app.project import create_project, project_dir
++
++    pid = create_project("test project")["id"]
++    yield pid
++    shutil.rmtree(project_dir(pid), ignore_errors=True)
++
++
++@pytest.fixture
++def client():
++    from fastapi.testclient import TestClient
++    from app.main import app
++
++    return TestClient(app, raise_server_exceptions=False)
++
++
++@pytest.fixture
++def fake_sandbox(monkeypatch):
++    """Replace Docker. Records commands; `creates` lists files (relative to the project) to write."""
++    from app import tools
++    from app.project import project_dir
++
++    class Fake:
++        calls = []
++        creates = []
++
++        def __call__(self, project_id, command, output_name=None):
++            self.calls.append(command)
++            root = project_dir(project_id)
++            for rel in self.creates:
++                target = root / rel
++                target.parent.mkdir(parents=True, exist_ok=True)
++                target.write_bytes(b"data")
++            return {"stdout": "", "stderr": "", "output": output_name}
++
++    fake = Fake()
++    fake.calls = []
++    fake.creates = []
++    monkeypatch.setattr(tools, "run_in_sandbox", fake)
++    return fake
++
++
++def make_renderable(pid):
++    """Give a project the minimum files a render needs."""
++    import json
++    from app.project import project_dir
++
++    root = project_dir(pid)
++    (root / "source" / "index.html").write_text("<html></html>", encoding="utf-8")
++    (root / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "s1", "duration_seconds": 2}]}), encoding="utf-8"
++    )
++    return root
+diff --git a/tests/test_backend.py b/tests/test_backend.py
+new file mode 100644
+index 0000000..23a41af
+--- /dev/null
++++ b/tests/test_backend.py
+@@ -0,0 +1,413 @@
++import json
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++
++from app import agent, docker_runner, tools, validation
++from app.config import PROJECT_ROOT
++from app.project import project_dir, create_project
++
++from conftest import make_renderable
++
++
++# --------------------------------------------------------------------------- project ids
++
++def test_project_id_must_be_a_uuid_hex():
++    for bad in ["..", "../x", "a", "g" * 32, "A" * 32, ""]:
++        with pytest.raises(FileNotFoundError):
++            project_dir(bad)
++    assert project_dir("a" * 32) == PROJECT_ROOT / ("a" * 32)
++
++
++def test_write_paths_do_not_create_directories_for_unknown_projects():
++    ghost = "0" * 32
++    with pytest.raises(FileNotFoundError):
++        tools.write_source(ghost, "index.html", "x")
++    with pytest.raises(FileNotFoundError):
++        tools.save_text_asset(ghost, "data", "a.json", "{}")
++    assert not (PROJECT_ROOT / ghost).exists()
++
++
++# --------------------------------------------------------------------------- validation
++
++@pytest.mark.parametrize(
++    "storyboard",
++    [
++        [],
++        "just a string",
++        {"scenes": []},
++        {"scenes": ["oops"]},
++        {"scenes": [{"id": "a", "duration_seconds": True}]},
++        {"scenes": [{"id": "a", "duration_seconds": 0}]},
++        {"scenes": [{"duration_seconds": 3}]},
++    ],
++)
++def test_malformed_storyboards_are_reported_not_raised(project, storyboard):
++    (project_dir(project) / "storyboard.json").write_text(json.dumps(storyboard))
++    result = validation.validate_project(project)
++    assert result["valid"] is False
++    assert result["errors"]
++
++
++def test_large_render_output_does_not_break_validation(project):
++    root = make_renderable(project)
++    big = root / "renders" / "final" / "final.mp4"
++    with open(big, "wb") as f:
++        f.truncate(60 * 1024 * 1024)  # > default MAX_FILE_BYTES (50 MB)
++    assert validation.validate_project(project)["valid"] is True
++
++
++def test_oversized_input_file_is_still_rejected(project):
++    root = make_renderable(project)
++    with open(root / "assets" / "video" / "huge.mp4", "wb") as f:
++        f.truncate(60 * 1024 * 1024)
++    result = validation.validate_project(project)
++    assert result["valid"] is False
++    assert any("huge.mp4" in e for e in result["errors"])
++
++
++def test_missing_entry_files_are_warnings_until_render_time(project):
++    soft = validation.validate_project(project)
++    assert soft["valid"] is True and len(soft["warnings"]) == 2
++    strict = validation.validate_project(project, require_renderable=True)
++    assert strict["valid"] is False
++    assert any("index.html" in e for e in strict["errors"])
++    assert any("storyboard.json" in e for e in strict["errors"])
++
++
++def test_scene_narration_must_exist(project):
++    root = make_renderable(project)
++    (root / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "s1", "duration_seconds": 2, "narration": "s1.wav"}]})
++    )
++    assert validation.validate_project(project)["valid"] is False
++    (root / "narration" / "s1.wav").write_bytes(b"x")
++    assert validation.validate_project(project)["valid"] is True
++
++
++# --------------------------------------------------------------------------- tools
++
++def test_write_source_blocks_traversal_and_bad_extensions(project):
++    for bad in ["../x.js", "/abs/x.js", "a/../../x.js", "run.exe", "noext"]:
++        with pytest.raises(ValueError):
++            tools.write_source(project, bad, "x")
++    out = tools.write_source(project, "scenes/intro.js", "console.log(1)")
++    assert out["path"] == "source/scenes/intro.js"
++    assert (project_dir(project) / "source" / "scenes" / "intro.js").is_file()
++
++
++def test_save_text_asset_enforces_extensions(project):
++    assert tools.save_text_asset(project, "data", "d.json", "{}")["path"] == "assets/data/d.json"
++    assert tools.save_text_asset(project, "narration", "n.txt", "hi")["path"] == "narration/n.txt"
++    for asset_type, name in [("data", "evil.exe"), ("image", "x.html"), ("narration", "x.wav")]:
++        with pytest.raises(ValueError):
++            tools.save_text_asset(project, asset_type, name, "x")
++    with pytest.raises(ValueError):  # "source" is reachable only through write_source
++        tools.save_text_asset(project, "source", "index.html", "x")
++
++
++def test_write_storyboard_accepts_json_string_and_rejects_junk(project):
++    sb = {"scenes": [{"id": "s1", "duration_seconds": 3}]}
++    tools.write_storyboard(project, json.dumps(sb))
++    assert json.loads((project_dir(project) / "storyboard.json").read_text()) == sb
++    for bad in [{}, {"scenes": []}, "not json", [1, 2]]:
++        with pytest.raises(ValueError):
++            tools.write_storyboard(project, bad)
++
++
++def test_generate_narration_passes_text_as_file_and_dedupes_manifest(project, fake_sandbox):
++    fake_sandbox.creates = ["narration/intro.wav"]
++    tools.generate_narration(project, "intro.wav", "-5 degrees is cold")
++    tools.generate_narration(project, "intro.wav", "second take")
++    cmd = fake_sandbox.calls[0]
++    assert "--text-file" in cmd and "--text" not in cmd
++    assert "/workspace/narration/intro.txt" in cmd
++    assert (project_dir(project) / "narration" / "intro.txt").read_text() == "second take"
++    manifest = json.loads((project_dir(project) / "project.json").read_text())
++    assert [n["filename"] for n in manifest["narration"]] == ["intro.wav"]
++
++
++def test_generate_narration_ignores_stale_audio(project, fake_sandbox):
++    stale = project_dir(project) / "narration" / "intro.wav"
++    stale.write_bytes(b"old audio")
++    fake_sandbox.creates = []  # the TTS run "succeeds" but produces nothing
++    with pytest.raises(RuntimeError):
++        tools.generate_narration(project, "intro.wav", "hello")
++
++
++def test_generate_narration_validates_input(project, fake_sandbox):
++    with pytest.raises(ValueError):
++        tools.generate_narration(project, "intro.mp3", "hello")
++    with pytest.raises(ValueError):
++        tools.generate_narration(project, "intro.wav", "   ")
++    assert fake_sandbox.calls == []
++
++
++def test_render_checks_project_and_params_before_starting_docker(project, fake_sandbox):
++    with pytest.raises(tools.ValidationFailed):
++        tools.render(project, 1920, 1080, 30)  # no index.html / storyboard.json yet
++    make_renderable(project)
++    for w, h, fps in [(1921, 1080, 30), (1920, 1081, 30), (1920, 1080, 0), (10, 10, 30), (1920, 1080, 500)]:
++        with pytest.raises(ValueError):
++            tools.render(project, w, h, fps)
++    assert fake_sandbox.calls == []
++
++
++def test_render_success_reports_video(project, fake_sandbox):
++    make_renderable(project)
++    fake_sandbox.creates = ["renders/final/final.mp4"]
++    result = tools.render(project, 1280, 720, 30)
++    assert result["video_url"] == f"/projects/{project}/video"
++    assert result["size_bytes"] == 4
++    assert "--width" in fake_sandbox.calls[0]
++
++
++def test_render_fails_loudly_when_no_video_appears(project, fake_sandbox):
++    make_renderable(project)
++    fake_sandbox.creates = []
++    with pytest.raises(RuntimeError):
++        tools.render(project, 1280, 720, 30)
++
++
++# --------------------------------------------------------------------------- docker runner
++
++def _capture_run(monkeypatch, results):
++    calls = []
++
++    def fake_run(cmd, **kwargs):
++        calls.append(cmd)
++        result = results[min(len(calls) - 1, len(results) - 1)]
++        if isinstance(result, Exception):
++            raise result
++        return result
++
++    monkeypatch.setattr(docker_runner.subprocess, "run", fake_run)
++    return calls
++
++
++def _done(code=0, stdout="", stderr=""):
++    return subprocess.CompletedProcess(["docker"], code, stdout, stderr)
++
++
++def test_timeout_kills_the_named_container(project, monkeypatch):
++    calls = _capture_run(
++        monkeypatch, [subprocess.TimeoutExpired("docker", 1), _done()]
++    )
++    with pytest.raises(docker_runner.DockerError, match="timed out"):
++        docker_runner.run_in_sandbox(project, ["true"])
++    run_cmd, kill_cmd = calls
++    name = run_cmd[run_cmd.index("--name") + 1]
++    assert kill_cmd == ["docker", "kill", name]
++
++
++def test_sandbox_command_is_locked_down_and_has_writable_home(project, monkeypatch):
++    calls = _capture_run(monkeypatch, [_done()])
++    docker_runner.run_in_sandbox(project, ["true"])
++    cmd = calls[0]
++    assert cmd[cmd.index("--network") + 1] == "none"
++    assert "--read-only" in cmd
++    assert cmd[cmd.index("-e") + 1] == "HOME=/tmp"
++    assert not any("docker.sock" in part for part in cmd)
++
++
++def test_host_project_root_is_used_for_the_bind_mount(project, monkeypatch):
++    monkeypatch.setattr(docker_runner, "HOST_PROJECT_ROOT", "/host/data/projects/")
++    calls = _capture_run(monkeypatch, [_done()])
++    docker_runner.run_in_sandbox(project, ["true"])
++    cmd = calls[0]
++    assert cmd[cmd.index("-v") + 1] == f"/host/data/projects/{project}:/workspace:rw"
++
++
++def test_errors_are_truncated_and_hinted(project, monkeypatch):
++    noisy = "x" * 50_000 + "\nUnable to find image 'ai-video-sandbox:latest' locally"
++    _capture_run(monkeypatch, [_done(125, stderr=noisy)])
++    with pytest.raises(docker_runner.DockerError) as info:
++        docker_runner.run_in_sandbox(project, ["true"])
++    message = str(info.value)
++    assert len(message) < 10_000
++    assert "docker build" in message
++
++
++@pytest.mark.parametrize(
++    "stderr",
++    [
++        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
++        'error during connect: Get "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.46/": open //./pipe/x',
++        "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct",
++    ],
++)
++def test_daemon_not_running_gets_a_hint(project, monkeypatch, stderr):
++    _capture_run(monkeypatch, [_done(1, stderr=stderr)])
++    with pytest.raises(docker_runner.DockerError, match="Docker Desktop"):
++        docker_runner.run_in_sandbox(project, ["true"])
++
++
++# --------------------------------------------------------------------------- HTTP API
++
++def test_upload_to_unknown_project_is_404_and_creates_nothing(client):
++    ghost = "1" * 32
++    r = client.post(f"/projects/{ghost}/assets", data={"asset_type": "image"}, files={"file": ("a.png", b"x")})
++    assert r.status_code == 404
++    assert not (PROJECT_ROOT / ghost).exists()
++
++
++def test_upload_validates_type_and_size(client, project, monkeypatch):
++    url = f"/projects/{project}/assets"
++    bad = client.post(url, data={"asset_type": "image"}, files={"file": ("a.exe", b"x")})
++    assert bad.status_code == 400
++
++    ok = client.post(url, data={"asset_type": "image"}, files={"file": ("logo.png", b"\x89PNG")})
++    assert ok.status_code == 200
++    assert (project_dir(project) / "assets" / "images" / "logo.png").is_file()
++
++    monkeypatch.setattr("app.main.MAX_FILE_BYTES", 10)
++    big = client.post(url, data={"asset_type": "data"}, files={"file": ("d.txt", b"y" * 100)})
++    assert big.status_code == 413
++    assert not (project_dir(project) / "assets" / "data" / "d.txt").exists()
++
++
++def test_validate_endpoint_shape_matches_what_the_ui_reads(client, project):
++    body = client.post(f"/projects/{project}/validate").json()
++    assert "valid" in body and "ok" not in body
++
++
++def test_unknown_project_is_404_everywhere(client):
++    ghost = "2" * 32
++    assert client.get(f"/projects/{ghost}").status_code == 404
++    assert client.post(f"/projects/{ghost}/validate").status_code == 404
++    assert client.post(f"/projects/{ghost}/render", json={}).status_code == 404
++    assert client.get(f"/projects/{ghost}/video").status_code == 404
++    assert client.get("/projects/not-an-id/video").status_code == 404
++
++
++def test_request_bodies_are_optional(client, project):
++    r = client.post(f"/projects/{project}/render")
++    assert r.status_code == 422 and "validation failed" in r.json()["detail"].lower()
++    r = client.post(f"/projects/{project}/agent")
++    assert r.status_code == 500 and "GROQ_API_KEY" in r.json()["detail"]
++
++
++def test_render_rejects_bad_dimensions(client, project):
++    assert client.post(f"/projects/{project}/render", json={"width": 1921}).status_code == 422
++    assert client.post(f"/projects/{project}/render", json={"fps": 0}).status_code == 422
++
++
++def test_video_endpoint_serves_the_render_without_caching(client, project):
++    root = make_renderable(project)
++    (root / "renders" / "final" / "final.mp4").write_bytes(b"mp4data")
++    r = client.get(f"/projects/{project}/video")
++    assert r.status_code == 200 and r.content == b"mp4data"
++    assert r.headers["cache-control"] == "no-store"
++
++
++def test_render_endpoint_end_to_end_with_fake_sandbox(client, project, fake_sandbox):
++    make_renderable(project)
++    fake_sandbox.creates = ["renders/final/final.mp4"]
++    r = client.post(f"/projects/{project}/render", json={"width": 1280, "height": 720, "fps": 24})
++    assert r.status_code == 200
++    assert r.json()["video_url"] == f"/projects/{project}/video"
++
++
++# --------------------------------------------------------------------------- agent loop
++
++def _tool_call(call_id, name, arguments):
++    return SimpleNamespace(
++        id=call_id, function=SimpleNamespace(name=name, arguments=arguments)
++    )
++
++
++def _response(content="", tool_calls=None):
++    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
++    return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
++
++
++def _install_fake_llm(monkeypatch, script):
++    """script: list of responses. Returns the list of message-histories seen per call."""
++    seen = []
++    remaining = list(script)
++
++    class FakeClient:
++        def __init__(self, **kwargs):
++            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
++
++        def _create(self, **kwargs):
++            seen.append(json.loads(json.dumps(kwargs["messages"], default=str)))
++            return remaining.pop(0)
++
++    monkeypatch.setattr(agent, "OpenAI", FakeClient)
++    monkeypatch.setattr(agent, "GROQ_API_KEY", "test-key")
++    return seen
++
++
++def _last_tool_output(history):
++    tool_msgs = [m for m in history if m["role"] == "tool"]
++    return json.loads(tool_msgs[-1]["content"])
++
++
++def test_agent_survives_empty_arguments_for_parameterless_tools(project, monkeypatch):
++    seen = _install_fake_llm(
++        monkeypatch,
++        [_response(tool_calls=[_tool_call("c1", "validate_project", "")]), _response("all good")],
++    )
++    result = agent.run_agent(project, "check it")
++    assert result == {"status": "completed", "message": "all good"}
++    out = _last_tool_output(seen[1])
++    assert out["ok"] is True and "valid" in out["result"]
++
++
++def test_agent_reports_unknown_tools_by_name(project, monkeypatch):
++    seen = _install_fake_llm(
++        monkeypatch,
++        [_response(tool_calls=[_tool_call("c1", "rm_rf", "{}")]), _response("ok")],
++    )
++    agent.run_agent(project, None)
++    out = _last_tool_output(seen[1])
++    assert out["ok"] is False and "rm_rf" in out["error"]
++
++
++def test_agent_can_write_storyboard_sent_as_a_string(project, monkeypatch):
++    sb = json.dumps({"scenes": [{"id": "s1", "duration_seconds": 4}]})
++    args = json.dumps({"storyboard": sb})
++    seen = _install_fake_llm(
++        monkeypatch,
++        [_response(tool_calls=[_tool_call("c1", "write_storyboard", args)]), _response("done")],
++    )
++    agent.run_agent(project, None)
++    assert _last_tool_output(seen[1])["ok"] is True
++    assert (project_dir(project) / "storyboard.json").is_file()
++
++
++def test_agent_cannot_copy_arbitrary_host_files(project, monkeypatch, tmp_path):
++    secret = tmp_path / "secret.txt"
++    secret.write_text("top secret")
++    args = json.dumps({"asset_type": "data", "source_path": str(secret)})
++    seen = _install_fake_llm(
++        monkeypatch,
++        [_response(tool_calls=[_tool_call("c1", "ingest_host_asset", args)]), _response("ok")],
++    )
++    agent.run_agent(project, "make a video about cats")
++    out = _last_tool_output(seen[1])
++    assert out["ok"] is False and "not supplied" in out["error"]
++    assert not (project_dir(project) / "assets" / "data" / "secret.txt").exists()
++
++
++def test_agent_can_ingest_a_path_the_user_typed(project, monkeypatch, tmp_path):
++    asset = tmp_path / "numbers.txt"
++    asset.write_text("1 2 3")
++    args = json.dumps({"asset_type": "data", "source_path": str(asset)})
++    seen = _install_fake_llm(
++        monkeypatch,
++        [_response(tool_calls=[_tool_call("c1", "ingest_host_asset", args)]), _response("ok")],
++    )
++    agent.run_agent(project, f"chart the numbers in {asset}")
++    assert _last_tool_output(seen[1])["ok"] is True
++    assert (project_dir(project) / "assets" / "data" / "numbers.txt").read_text() == "1 2 3"
++
++
++def test_agent_tool_names_match_dispatcher():
++    schema_names = {t["function"]["name"] for t in agent._tool_schemas()}
++    assert schema_names == {
++        "write_storyboard", "write_source", "save_text_asset", "generate_narration",
++        "ingest_host_asset", "validate_project", "render_video",
++    }
+diff --git a/tests/test_renderer.py b/tests/test_renderer.py
+new file mode 100644
+index 0000000..ae588af
+--- /dev/null
++++ b/tests/test_renderer.py
+@@ -0,0 +1,261 @@
++"""Tests for the pure parts of the sandbox renderer and TTS scripts.
++
++These run on the host: they need no Chromium, Playwright, Docker or speech engine.
++The ffmpeg tests are skipped when ffmpeg/ffprobe are unavailable.
++"""
++import importlib.util
++import json
++import shutil
++import subprocess
++import sys
++import wave
++from pathlib import Path
++
++import pytest
++
++RENDERER_DIR = Path(__file__).resolve().parents[1] / "sandbox" / "renderer"
++
++
++def _load(name):
++    spec = importlib.util.spec_from_file_location(name, RENDERER_DIR / f"{name}.py")
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++render = _load("render")
++tts = _load("tts")
++
++
++def make_wav(path, seconds=0.5, rate=22050, freq=440):
++    import math
++    import struct
++
++    frames = b"".join(
++        struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / rate)))
++        for i in range(int(rate * seconds))
++    )
++    with wave.open(str(path), "wb") as w:
++        w.setnchannels(1)
++        w.setsampwidth(2)
++        w.setframerate(rate)
++        w.writeframes(frames)
++    return path
++
++
++# ------------------------------------------------------------------ storyboard / audio plan
++
++def test_load_storyboard_sums_durations(tmp_path):
++    (tmp_path / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "a", "duration_seconds": 2}, {"id": "b", "duration_seconds": 3.5}]})
++    )
++    _, total = render.load_storyboard(tmp_path)
++    assert total == pytest.approx(5.5)
++
++
++@pytest.mark.parametrize("bad", [[], {"scenes": []}, {"scenes": ["x"]}, {"scenes": [{"id": "a", "duration_seconds": 0}]}])
++def test_load_storyboard_rejects_bad_input(tmp_path, bad):
++    (tmp_path / "storyboard.json").write_text(json.dumps(bad))
++    with pytest.raises(RuntimeError):
++        render.load_storyboard(tmp_path)
++
++
++def test_plan_audio_places_clip_at_its_scene_start(tmp_path):
++    (tmp_path / "narration").mkdir()
++    make_wav(tmp_path / "narration" / "two.wav")
++    make_wav(tmp_path / "narration" / "three.wav")
++    scenes = [
++        {"id": "a", "duration_seconds": 4},
++        {"id": "b", "duration_seconds": 5, "narration": "two.wav"},
++        {"id": "c", "duration_seconds": 6, "narration": "narration/three.wav"},
++    ]
++    plan = render.plan_audio(tmp_path, scenes)
++    assert [(p.name, s) for p, s in plan] == [("two.wav", 4.0), ("three.wav", 9.0)]
++
++
++def test_plan_audio_falls_back_to_back_to_back_clips(tmp_path):
++    (tmp_path / "narration").mkdir()
++    make_wav(tmp_path / "narration" / "a.wav", seconds=1.0)
++    make_wav(tmp_path / "narration" / "b.wav", seconds=2.0)
++    plan = render.plan_audio(tmp_path, [{"id": "s", "duration_seconds": 10}])
++    assert [(p.name, round(s, 2)) for p, s in plan] == [("a.wav", 0.0), ("b.wav", 1.0)]
++
++
++def test_plan_audio_without_any_narration_is_empty(tmp_path):
++    assert render.plan_audio(tmp_path, [{"id": "s", "duration_seconds": 3}]) == []
++
++
++def test_plan_audio_rejects_missing_referenced_clip(tmp_path):
++    with pytest.raises(RuntimeError, match="missing narration"):
++        render.plan_audio(tmp_path, [{"id": "s", "duration_seconds": 3, "narration": "nope.wav"}])
++
++
++# ------------------------------------------------------------------ ffmpeg command
++
++def test_ffmpeg_cmd_without_audio_is_silent_and_trimmed(tmp_path):
++    cmd = render.build_ffmpeg_cmd(tmp_path / "in.webm", tmp_path / "out.mp4", 30, 8.0, 0.4, [])
++    assert "-an" in cmd and "-filter_complex" not in cmd
++    assert cmd[cmd.index("-ss") + 1] == "0.400"
++    assert cmd[cmd.index("-t") + 1] == "8.000"
++    assert cmd.index("-ss") < cmd.index("-i")  # input option, applies to the video
++
++
++def test_ffmpeg_cmd_mixes_every_clip_with_its_delay(tmp_path):
++    tracks = [(tmp_path / "a.wav", 0.0), (tmp_path / "b.wav", 2.5)]
++    cmd = render.build_ffmpeg_cmd(tmp_path / "in.webm", tmp_path / "out.mp4", 30, 8.0, 0.0, tracks)
++    graph = cmd[cmd.index("-filter_complex") + 1]
++    assert "adelay=0|0" in graph and "adelay=2500|2500" in graph
++    assert "amix=inputs=2:normalize=0" in graph
++    assert "-ss" not in cmd  # zero offset means no trimming
++
++
++# ------------------------------------------------------------------ real ffmpeg
++
++def _ffmpeg_can_encode(tmp_path):
++    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
++        return False
++    probe = subprocess.run(
++        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=0.2:size=64x64:rate=10",
++         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(tmp_path / "probe.mp4")],
++        capture_output=True,
++    )
++    return probe.returncode == 0
++
++
++def _ffprobe(path, entries):
++    out = subprocess.run(
++        ["ffprobe", "-v", "error", "-show_entries", entries, "-of", "default=nw=1", str(path)],
++        capture_output=True, text=True, check=True,
++    ).stdout
++    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
++
++
++@pytest.fixture
++def source_video(tmp_path):
++    if not _ffmpeg_can_encode(tmp_path):
++        pytest.skip("ffmpeg with libx264 and ffprobe is required")
++    src = tmp_path / "recording.mp4"
++    subprocess.run(
++        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=4:size=320x240:rate=25",
++         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
++        capture_output=True, check=True,
++    )
++    return src
++
++
++def test_encode_trims_to_storyboard_length_and_mixes_audio(tmp_path, source_video):
++    a = make_wav(tmp_path / "a.wav", seconds=0.5)
++    b = make_wav(tmp_path / "b.wav", seconds=0.5, freq=660)
++    out = tmp_path / "final.mp4"
++    render.encode(source_video, out, 30, 2.0, 0.5, [(a, 0.0), (b, 1.0)])
++
++    assert abs(float(_ffprobe(out, "format=duration")["duration"]) - 2.0) < 0.15
++    streams = subprocess.run(
++        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,channels,sample_rate",
++         "-of", "json", str(out)],
++        capture_output=True, text=True, check=True,
++    ).stdout
++    info = {s["codec_type"]: s for s in json.loads(streams)["streams"]}
++    assert info["video"]["codec_name"] == "h264"
++    assert info["audio"]["codec_name"] == "aac"
++    assert info["audio"]["channels"] == 2 and info["audio"]["sample_rate"] == "48000"
++
++
++def test_encode_places_audio_at_the_requested_time(tmp_path, source_video):
++    """The clip is delayed by 1s, so the first second of audio must be silent and later audio loud."""
++    clip = make_wav(tmp_path / "tone.wav", seconds=0.5)
++    out = tmp_path / "final.mp4"
++    render.encode(source_video, out, 30, 2.0, 0.0, [(clip, 1.0)])
++
++    def peak(start, dur):
++        res = subprocess.run(
++            ["ffmpeg", "-hide_banner", "-nostats", "-ss", str(start), "-t", str(dur), "-i", str(out),
++             "-vn", "-af", "volumedetect", "-f", "null", "-"],
++            capture_output=True, text=True,
++        )
++        for line in res.stderr.splitlines():
++            if "max_volume" in line:
++                return float(line.split("max_volume:")[1].split("dB")[0])
++        return float("-inf")
++
++    before, during = peak(0.0, 0.8), peak(1.05, 0.4)
++    assert before != float("-inf") and during != float("-inf"), "volumedetect produced no reading"
++    assert before < -60  # silence before the clip starts
++    assert during > -20  # tone while it plays
++
++
++def test_encode_without_tracks_has_no_audio_stream(tmp_path, source_video):
++    out = tmp_path / "silent.mp4"
++    render.encode(source_video, out, 30, 2.0, 0.0, [])
++    codec_types = subprocess.run(
++        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(out)],
++        capture_output=True, text=True, check=True,
++    ).stdout.split()
++    assert codec_types == ["video"]
++
++
++def test_encode_surfaces_ffmpeg_errors(tmp_path):
++    if not shutil.which("ffmpeg"):
++        pytest.skip("ffmpeg is required")
++    with pytest.raises(RuntimeError):
++        render.encode(tmp_path / "missing.webm", tmp_path / "out.mp4", 30, 1.0, 0.0, [])
++
++
++# ------------------------------------------------------------------ tts
++
++def test_tts_accepts_text_file_or_text_but_not_both_or_neither():
++    args = tts.parse_args(["--text-file", "/x.txt", "--output", "/o.wav"])
++    assert args.text_file == "/x.txt" and args.text is None
++    args = tts.parse_args(["--text=-5 degrees", "--output", "/o.wav"])
++    assert args.text == "-5 degrees"
++    with pytest.raises(SystemExit):
++        tts.parse_args(["--output", "/o.wav"])
++    with pytest.raises(SystemExit):
++        tts.parse_args(["--text", "a", "--text-file", "b", "--output", "/o.wav"])
++
++
++class _StubEngine:
++    def __init__(self, writes):
++        self.writes = writes
++        self.path = None
++        self.props = {}
++
++    def setProperty(self, key, value):
++        self.props[key] = value
++
++    def save_to_file(self, text, path):
++        self.path = path
++
++    def runAndWait(self):
++        if self.writes:
++            Path(self.path).write_bytes(b"RIFFdata")
++
++
++def _stub_pyttsx3(monkeypatch, writes):
++    engine = _StubEngine(writes)
++    module = type(sys)("pyttsx3")
++    module.init = lambda: engine
++    monkeypatch.setitem(sys.modules, "pyttsx3", module)
++    return engine
++
++
++def test_tts_writes_the_file_and_clamps_volume(tmp_path, monkeypatch):
++    engine = _stub_pyttsx3(monkeypatch, writes=True)
++    out = tmp_path / "n" / "a.wav"
++    tts.synthesize("hello", out, rate=150, volume=7.0)
++    assert out.read_bytes() == b"RIFFdata"
++    assert engine.props == {"rate": 150, "volume": 1.0}
++
++
++def test_tts_does_not_mistake_a_stale_file_for_success(tmp_path, monkeypatch):
++    _stub_pyttsx3(monkeypatch, writes=False)
++    out = tmp_path / "a.wav"
++    out.write_bytes(b"old")
++    with pytest.raises(RuntimeError):
++        tts.synthesize("hello", out)
++
++
++def test_tts_rejects_empty_text(tmp_path, monkeypatch):
++    _stub_pyttsx3(monkeypatch, writes=True)
++    with pytest.raises(RuntimeError):
++        tts.synthesize("  \n ", tmp_path / "a.wav")
+-- 
+2.43.0
+
