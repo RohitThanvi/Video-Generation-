@@ -4,6 +4,7 @@ import re
 import time
 from .config import GROQ_API_KEY, GROQ_MODEL
 from .project import project_dir, load_project, list_files
+from .web_assets import search_free_images, download_asset
 from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render, install_design_kit
 
 MAX_RETRIES = 6
@@ -33,7 +34,7 @@ inside the project workspace using ONLY the provided tools.
 
 ## Hard rules
 - Never invent filesystem locations; use the semantic tools. Source code goes in source/, narration text in narration/.
-- The renderer has no network: no CDNs, no remote images/fonts/scripts. Everything is local or inline.
+- The renderer has no network: no CDNs, no remote images/fonts/scripts. Everything is local or inline. To use web material, call search_free_images (openly licensed, free) and download_asset first, then reference the saved local file (e.g. ../assets/images/x.jpg). Only download what the video needs; credit the creator in a final scene when the license requires attribution.
 - Canvas is 1920x1080. The page is rendered frame by frame on a virtual clock that starts at page load (performance.now, Date, requestAnimationFrame, timers, CSS animations, GSAP and three.js clocks all follow it, so nothing drops frames); video length = sum of storyboard durations.
 - Audio inside the page is NOT recorded. Narration is made with generate_narration and attached to a scene in storyboard.json ("narration": "<file>.wav"); the compiler mixes it in.
 - The page is served over http inside the sandbox: relative fetch() of project files works, but prefer inlining small data.
@@ -188,6 +189,34 @@ def _tool_schemas():
         {
             "type": "function",
             "function": {
+                "name": "search_free_images",
+                "description": "Search openly licensed images on the web (Openverse, free). Returns direct image URLs with license and creator. Download one with download_asset, then reference it as a local file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "download_asset",
+                "description": "Download a public http(s) file (image, font, audio, data...) into the project's asset folder on the host. The sandbox itself stays offline, so always download first and use the local path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "asset_type": {"type": "string", "enum": ["image", "video", "audio", "font", "model3d", "data"]},
+                        "url": {"type": "string"},
+                        "filename": {"type": "string"}
+                    },
+                    "required": ["asset_type", "url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "validate_project",
                 "description": "Validate file placement, extensions, size limits, and storyboard structure.",
                 "parameters": {"type": "object", "properties": {}}
@@ -253,6 +282,10 @@ def _call_tool(project_id, name, args, supplied_text=""):
             args["source_path"],
             args.get("filename"),
         )
+    if name == "search_free_images":
+        return search_free_images(args["query"], int(args.get("limit") or 6))
+    if name == "download_asset":
+        return download_asset(project_id, args["asset_type"], args["url"], args.get("filename"))
     if name == "validate_project":
         return validate(project_id)
     if name == "render_video":

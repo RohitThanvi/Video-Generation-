@@ -30,6 +30,10 @@ SANDBOX_CPUS = os.getenv("SANDBOX_CPUS", "4")
 SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
 SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "3600"))
 
+# Lets the agent search free (openly licensed) images and download assets on the API host.
+# The render sandbox itself always stays offline.
+ALLOW_WEB_ASSETS = os.getenv("ALLOW_WEB_ASSETS", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
 DEFAULT_WIDTH = int(os.getenv("DEFAULT_WIDTH", "1920"))
 DEFAULT_HEIGHT = int(os.getenv("DEFAULT_HEIGHT", "1080"))

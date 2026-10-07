@@ -410,6 +410,7 @@ def test_agent_tool_names_match_dispatcher():
     assert schema_names == {
         "write_storyboard", "write_source", "save_text_asset", "generate_narration",
         "ingest_host_asset", "validate_project", "render_video", "install_design_kit",
+        "search_free_images", "download_asset",
     }
 
 

@@ -300,3 +300,11 @@ Notes:
 - Rebuild the sandbox image once (`docker build -t ai-video-sandbox:latest sandbox`); the apt/pip
   layers are cached, only the JS-library layer is new.
 - The design kit pages assume a 1920x1080 canvas.
+
+## Free web images and asset downloads
+
+The agent can search openly licensed images (Openverse, no API key) with `search_free_images` and
+fetch public files with `download_asset`. Downloads run on the API host, are saved into the
+project's `assets/` folders, and the render sandbox stays offline (it only sees local files).
+Guards: http(s) only, public IPs only (redirects re-checked), size limit `MAX_FILE_BYTES`, file
+type must match the asset category. Disable with `ALLOW_WEB_ASSETS=false`.
