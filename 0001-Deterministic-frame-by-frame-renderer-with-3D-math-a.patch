@@ -1,0 +1,2067 @@
+From 08a95acbecff9ea7f32cf239ec125812f094189c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 14:01:19 +0000
+Subject: [PATCH] Deterministic frame-by-frame renderer with 3D, math and
+ cartoon styles
+
+- runtime.js: virtual clock (time, timers, rAF, CSS/Web animations) so every frame is exact
+- render.py: loopback HTTP server, /vendor libs + import map, PNG frames piped to ffmpeg
+- three, gsap, d3, katex bundled in the sandbox image; mathkit (manim-style) toolkit
+- agent prompt: choose 3D / math / cartoon / design-kit style from the request
+- examples (math-3b1b, three-3d, cartoon-explainer), CLI `example` command
+- tests rewritten for the new renderer; SANDBOX_TIMEOUT_SECONDS default 3600
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NcAwjchdbi5Eq6yZ1zyXGN
+---
+ .env.example                                 |   2 +-
+ README.md                                    |  29 +
+ app/agent.py                                 |  12 +-
+ app/config.py                                |   2 +-
+ app/tools.py                                 |  13 +
+ examples/cartoon-explainer/source/index.html |  83 +++
+ examples/cartoon-explainer/storyboard.json   |   6 +
+ examples/math-3b1b/source/index.html         |  55 ++
+ examples/math-3b1b/storyboard.json           |   6 +
+ examples/three-3d/source/index.html          |  86 +++
+ examples/three-3d/storyboard.json            |   5 +
+ sandbox/Dockerfile                           |  13 +-
+ sandbox/renderer/mathkit/mathkit.js          | 638 +++++++++++++++++++
+ sandbox/renderer/render.py                   | 445 ++++++++++---
+ sandbox/renderer/runtime.js                  | 156 +++++
+ scripts/cli.py                               |  24 +-
+ tests/test_renderer.py                       | 169 ++++-
+ 17 files changed, 1625 insertions(+), 119 deletions(-)
+ create mode 100644 examples/cartoon-explainer/source/index.html
+ create mode 100644 examples/cartoon-explainer/storyboard.json
+ create mode 100644 examples/math-3b1b/source/index.html
+ create mode 100644 examples/math-3b1b/storyboard.json
+ create mode 100644 examples/three-3d/source/index.html
+ create mode 100644 examples/three-3d/storyboard.json
+ create mode 100644 sandbox/renderer/mathkit/mathkit.js
+ create mode 100644 sandbox/renderer/runtime.js
+
+diff --git a/.env.example b/.env.example
+index ea09f39..aebb8f3 100644
+--- a/.env.example
++++ b/.env.example
+@@ -14,7 +14,7 @@ SANDBOX_IMAGE=ai-video-sandbox:latest
+ SANDBOX_MEMORY=6g
+ SANDBOX_CPUS=4
+ SANDBOX_PIDS_LIMIT=256
+-SANDBOX_TIMEOUT_SECONDS=900
++SANDBOX_TIMEOUT_SECONDS=3600
+ 
+ DEFAULT_FPS=30
+ DEFAULT_WIDTH=1920
+diff --git a/README.md b/README.md
+index a790b57..80c3c9d 100644
+--- a/README.md
++++ b/README.md
+@@ -271,3 +271,32 @@ Audio is sequential by construction:
+ 
+ Rebuild the sandbox image after pulling (`docker build -t ai-video-sandbox sandbox`): it now installs
+ `fonts-inter` and `fonts-roboto`.
++
++## Rendering engine, 3D, math and cartoon styles
++
++Videos are rendered **frame by frame**, not recorded in real time. The page runs against a
++virtual clock (`sandbox/renderer/runtime.js`): `performance.now`, `Date`, `requestAnimationFrame`,
++timers, CSS animations/transitions and Web Animations all advance exactly 1/fps per frame, so
++output is deterministic and never drops frames, however heavy the scene. Each frame is a PNG
++screenshot piped to ffmpeg (H.264, BT.709, narration mixed in).
++
++Optional page hooks: `window.__renderFrame(tMs, frameIndex)` (draw/seek yourself, may be async;
++do not return a GSAP timeline from it) and `window.__VIDEO_READY` (a Promise the renderer awaits
++before frame 0). Globals: `__VIDEO_FPS__`, `__VIDEO_TOTAL__`, `__VIDEO_WIDTH__`, `__VIDEO_HEIGHT__`,
++`__VIDEO_SCENES__`.
++
++Libraries available offline (served under `/vendor/<name>/`, import map injected automatically):
++`three`, `gsap`, `d3`, `katex`, and `mathkit` (a small manim-style toolkit for 3Blue1Brown-style
++math animation: `Scene`, `create`, `write`, `morph`, `shift`, `camera`, axes/plots, LaTeX via KaTeX).
++The agent picks the style from the request (3D, math, cartoon, or the default design kit); users
++never need to mention HTML/CSS.
++
++Try the examples: `python scripts/cli.py example math-3b1b` (also `three-3d`, `cartoon-explainer`),
++then `python scripts/cli.py render <project_id>`.
++
++Notes:
++- Frame-by-frame rendering is slower than real time (minutes per video; WebGL is software-rendered).
++  Use a lower fps/resolution for drafts. `SANDBOX_TIMEOUT_SECONDS` now defaults to 3600.
++- Rebuild the sandbox image once (`docker build -t ai-video-sandbox:latest sandbox`); the apt/pip
++  layers are cached, only the JS-library layer is new.
++- The design kit pages assume a 1920x1080 canvas.
+diff --git a/app/agent.py b/app/agent.py
+index 4cdbb4f..4dbd6e0 100644
+--- a/app/agent.py
++++ b/app/agent.py
+@@ -34,9 +34,9 @@ inside the project workspace using ONLY the provided tools.
+ ## Hard rules
+ - Never invent filesystem locations; use the semantic tools. Source code goes in source/, narration text in narration/.
+ - The renderer has no network: no CDNs, no remote images/fonts/scripts. Everything is local or inline.
+-- Canvas is 1920x1080. The page is recorded in real time from page load; video length = sum of storyboard durations.
++- Canvas is 1920x1080. The page is rendered frame by frame on a virtual clock that starts at page load (performance.now, Date, requestAnimationFrame, timers, CSS animations, GSAP and three.js clocks all follow it, so nothing drops frames); video length = sum of storyboard durations.
+ - Audio inside the page is NOT recorded. Narration is made with generate_narration and attached to a scene in storyboard.json ("narration": "<file>.wav"); the compiler mixes it in.
+-- fetch() cannot read file:// URLs: inline any data.
++- The page is served over http inside the sandbox: relative fetch() of project files works, but prefer inlining small data.
+ - Keep facts accurate and spell text exactly. Never claim success before render_video returns ok. Never run host commands. ingest_host_asset only for paths the user wrote.
+ - Keep every file SHORT and never repeat yourself: no duplicated CSS rules, no repeated keyframe percentages, no filler. A complete index.html is typically 120-250 lines.
+ 
+@@ -80,6 +80,14 @@ inside the project workspace using ONLY the provided tools.
+ - Order of elements in time must equal the order they are mentioned in the narration.
+ - Never put two scenes' narration in one clip, never reuse a clip name for different scenes.
+ 
++## Other styles: choose from the user's request (the kit above is the default)
++- 3D (3D, WebGL, three.js, spinning object, planet, camera orbit): do NOT use the kit. One <script type="module"> with `import * as THREE from 'three'`. Create `new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true})`, setPixelRatio(1), setSize(innerWidth, innerHeight); build geometry procedurally (no remote models). Drive everything from time only: `window.__renderFrame = (tMs) => { update(tMs/1000); renderer.render(scene, camera); }; window.__renderFrame(0);`. Titles: HTML overlay (position:fixed) with CSS animations.
++- MATH / 3Blue1Brown style (graphs, equations, vectors, calculus, proofs): do NOT use the kit. Use mathkit (black background, KaTeX): `import { Scene, COLORS, create, write, fadeIn, fadeOut, swap, morph, shift, moveTo, colorTo, custom, along } from 'mathkit'`.
++  Frame is x -8..8, y -4.5..4.5 (y up). `const s = new Scene()`. Builders (options {color, fill, width, dashed}): s.axes({xRange:[-4,4,1], yRange:[-3,3,1], xLength, yLength, center, grid, labels, xLabel:'x'}) returns a group with .plot(fn,{color,xRange}) .area(fn,[a,b]) .point(x,y) .vector([x,y]) .c2p(x,y); s.line(a,b) s.arrow(a,b) s.dot(p) s.circle(c,r) s.rect(c,w,h) s.polygon(pts) s.parametric(t=>[x,y],{tRange}) s.text(str,{at,size,color}) s.tex(latex,{at,size,color}) s.group(...els). LaTeX needs doubled backslashes in JS strings.
++  Elements are INVISIBLE until introduced: s.add(el) or an animation. Play in order: `s.play(create(axes), write(title))` (items in one play() run together), `s.wait(1)`, `s.camera({center:[x,y], zoom:2})`; morph(plot, newFn) turns one curve into another; all animations take {duration}. End with `s.padTo(window.__VIDEO_TOTAL__); s.start();` and make the storyboard durations equal the animation length.
++- CARTOON / animated explainer (characters, motion graphics, squash and stretch): do NOT use the kit. Inline SVG + GSAP: `<script src="/vendor/gsap/dist/gsap.min.js"></script>`. Build `const tl = gsap.timeline({paused:true})`, then `window.__renderFrame = (tMs) => tl.time(Math.min(tMs/1000, tl.duration()), false)`. Draw strokes by tweening attr (`{attr:{'stroke-dashoffset':0}}`), never the CSS property (GSAP rounds it to whole pixels).
++- Non-kit styles still get narration through generate_narration + storyboard "narration"; skip install_design_kit and the data-scene markup, and still call validate_project before render_video.
++
+ Create a polished explainer with real content and real visuals, not placeholders.
+ """
+ 
+diff --git a/app/config.py b/app/config.py
+index 245cfd2..d3f6545 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -28,7 +28,7 @@ SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "ai-video-sandbox:latest")
+ SANDBOX_MEMORY = os.getenv("SANDBOX_MEMORY", "6g")
+ SANDBOX_CPUS = os.getenv("SANDBOX_CPUS", "4")
+ SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
+-SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "900"))
++SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "3600"))
+ 
+ DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
+ DEFAULT_WIDTH = int(os.getenv("DEFAULT_WIDTH", "1920"))
+diff --git a/app/tools.py b/app/tools.py
+index 1cfe145..c46049a 100644
+--- a/app/tools.py
++++ b/app/tools.py
+@@ -221,4 +221,17 @@ def render(project_id: str, width: int, height: int, fps: int):
+         raise RuntimeError("Render finished but renders/final/final.mp4 is missing.")
+     result["video_url"] = f"/projects/{project_id}/video"
+     result["size_bytes"] = video.stat().st_size
++    # render.py prints one JSON line (progress goes to stderr). Surface the useful parts,
++    # above all the page's own console errors (missing assets, JS errors, a timeline whose
++    # length differs from the storyboard), so the agent can fix them instead of guessing.
++    for line in reversed((result.get("stdout") or "").strip().splitlines()):
++        try:
++            info = json.loads(line)
++        except ValueError:
++            continue
++        if isinstance(info, dict) and info.get("ok"):
++            for key in ("frames", "fps", "render_seconds", "browser_messages"):
++                if key in info:
++                    result[key] = info[key]
++            break
+     return result
+diff --git a/examples/cartoon-explainer/source/index.html b/examples/cartoon-explainer/source/index.html
+new file mode 100644
+index 0000000..857a858
+--- /dev/null
++++ b/examples/cartoon-explainer/source/index.html
+@@ -0,0 +1,83 @@
++<!doctype html>
++<html>
++<head>
++  <meta charset="utf-8" />
++  <title>Cartoon explainer</title>
++  <style>
++    html, body { margin: 0; height: 100%; overflow: hidden; background: #8fd3ff; }
++    svg { position: fixed; inset: 0; width: 100vw; height: 100vh; }
++    #caption {
++      position: fixed; top: 70px; left: 0; right: 0; text-align: center;
++      font: 700 76px 'DejaVu Sans', Arial, sans-serif; color: #17324d; opacity: 0;
++    }
++    .cloud { animation: drift 8s linear forwards; }
++    @keyframes drift { from { transform: translateX(0); } to { transform: translateX(260px); } }
++  </style>
++</head>
++<body>
++<svg viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice">
++  <defs>
++    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
++      <stop offset="0" stop-color="#5ab8ff" /><stop offset="1" stop-color="#d9f2ff" />
++    </linearGradient>
++    <radialGradient id="ballGrad" cx="35%" cy="30%" r="75%">
++      <stop offset="0" stop-color="#ff9a8a" /><stop offset="1" stop-color="#e5334b" />
++    </radialGradient>
++  </defs>
++  <rect width="1920" height="1080" fill="url(#sky)" />
++  <circle cx="1560" cy="230" r="95" fill="#ffe27a" />
++  <g class="cloud" fill="#fff" opacity=".95">
++    <ellipse cx="300" cy="300" rx="130" ry="48" /><ellipse cx="380" cy="270" rx="90" ry="50" /><ellipse cx="230" cy="282" rx="70" ry="38" />
++  </g>
++  <g class="cloud" fill="#fff" opacity=".9" style="animation-duration: 8s">
++    <ellipse cx="1100" cy="190" rx="110" ry="40" /><ellipse cx="1170" cy="165" rx="75" ry="42" />
++  </g>
++  <path d="M0 800 Q 500 640 960 780 T 1920 760 V1080 H0Z" fill="#7bd36b" />
++  <rect y="880" width="1920" height="200" fill="#5bb34e" />
++  <ellipse id="shadow" cx="960" cy="905" rx="110" ry="22" fill="#000" opacity=".25" />
++  <g id="ball">
++    <circle r="100" fill="url(#ballGrad)" />
++    <ellipse cx="-34" cy="-40" rx="26" ry="16" fill="#fff" opacity=".55" transform="rotate(-30 -34 -40)" />
++  </g>
++</svg>
++<div id="caption"></div>
++
++<script src="/vendor/gsap/dist/gsap.min.js"></script>
++<script>
++  // Everything is a function of time: build a paused timeline and seek it each frame.
++  const GROUND = 805;     // y of the ball centre when it touches the floor
++  gsap.set('#ball', { x: 960, y: 230, transformOrigin: '50% 100%' });
++
++  const tl = gsap.timeline({ paused: true });
++  const caption = document.getElementById('caption');
++  const say = (text, at) => {
++    tl.call(() => { caption.textContent = text; }, null, at);
++    tl.fromTo(caption, { opacity: 0, y: 30 }, { opacity: 1, y: 0, duration: 0.4 }, at);
++  };
++
++  say('Gravity pulls it down...', 0.2);
++  let t = 0.2;
++  [230, 430, 600].forEach((fromY, i) => {
++    const fall = 0.62 - i * 0.1;
++    tl.to('#ball', { y: GROUND, duration: fall, ease: 'power2.in' }, t);                         // fall
++    tl.to('#ball', { scaleY: 1.18, scaleX: 0.9, duration: fall * 0.9, ease: 'none' }, t);        // stretch
++    t += fall;
++    tl.to('#ball', { scaleY: 0.62, scaleX: 1.35, duration: 0.07, ease: 'power1.out' }, t);       // squash
++    tl.to('#ball', { scaleY: 1.0, scaleX: 1.0, duration: 0.18, ease: 'elastic.out(1,.4)' }, t + 0.07);
++    const nextTop = i < 2 ? [430, 600, 740][i] : null;
++    if (nextTop !== null) {
++      tl.to('#ball', { y: nextTop, duration: fall * 0.95, ease: 'power2.out' }, t + 0.07);
++      t += 0.07 + fall * 0.95;
++    }
++  });
++  tl.to('#shadow', { attr: { rx: 150 }, opacity: 0.35, duration: 0.3 }, 0.2);
++  say('...and squash & stretch sells the weight.', 2.6);
++  tl.to('#ball', { x: 2200, rotation: 720, duration: 2.2, ease: 'power2.in' }, 5.2);
++  tl.to('#shadow', { x: 1240, opacity: 0, duration: 2.2, ease: 'power2.in' }, 5.2);
++  tl.to(caption, { opacity: 0, duration: 0.4 }, 7.4);
++
++  window.__renderFrame = (tMs) => { tl.time(Math.min(tMs / 1000, tl.duration()), false); };
++  if (!window.__VIDEO_EXPORT__) tl.play();
++</script>
++</body>
++</html>
+diff --git a/examples/cartoon-explainer/storyboard.json b/examples/cartoon-explainer/storyboard.json
+new file mode 100644
+index 0000000..91e0eca
+--- /dev/null
++++ b/examples/cartoon-explainer/storyboard.json
+@@ -0,0 +1,6 @@
++{
++  "scenes": [
++    { "id": "bounce", "title": "Squash and stretch", "duration_seconds": 5 },
++    { "id": "roll", "title": "Roll out", "duration_seconds": 3 }
++  ]
++}
+diff --git a/examples/math-3b1b/source/index.html b/examples/math-3b1b/source/index.html
+new file mode 100644
+index 0000000..0215099
+--- /dev/null
++++ b/examples/math-3b1b/source/index.html
+@@ -0,0 +1,55 @@
++<!doctype html>
++<html>
++<head>
++  <meta charset="utf-8" />
++  <title>Square wave from sine waves</title>
++</head>
++<body>
++<script type="module">
++  import { Scene, COLORS as C, create, write, fadeIn, swap, morph } from 'mathkit';
++
++  const scene = new Scene();
++
++  // Partial sums of the Fourier series of a square wave: (4/pi) * sum over odd k of sin(kx)/k
++  const partial = (n) => (x) => {
++    let s = 0;
++    for (let k = 1; k <= n; k += 2) s += Math.sin(k * x) / k;
++    return (4 / Math.PI) * s;
++  };
++
++  const title = scene.tex('\\text{Building a square wave from sine waves}', { at: [0, 3.6], size: 50 });
++  const axes = scene.axes({
++    xRange: [-Math.PI - 0.4, Math.PI + 0.4, Math.PI / 2],
++    yRange: [-1.6, 1.6, 1],
++    xLength: 12, yLength: 4.2, center: [0, -0.4], color: C.GREY,
++  });
++  const piLabel = scene.tex('\\pi', { at: [axes.c2p(Math.PI, 0)[0], axes.c2p(Math.PI, 0)[1] - 0.35], size: 34, color: C.GREY });
++  const minusPi = scene.tex('-\\pi', { at: [axes.c2p(-Math.PI, 0)[0], axes.c2p(-Math.PI, 0)[1] - 0.35], size: 34, color: C.GREY });
++
++  const wave = axes.plot(partial(1), { color: C.BLUE, width: 6 });
++
++  const labelAt = [0, 2.75];
++  const labels = [
++    scene.tex('\\tfrac{4}{\\pi}\\sin x', { at: labelAt, size: 50, color: C.BLUE }),
++    scene.tex('\\tfrac{4}{\\pi}\\left(\\sin x+\\tfrac{\\sin 3x}{3}\\right)', { at: labelAt, size: 46, color: C.TEAL }),
++    scene.tex('\\tfrac{4}{\\pi}\\left(\\sin x+\\tfrac{\\sin 3x}{3}+\\tfrac{\\sin 5x}{5}\\right)', { at: labelAt, size: 44, color: C.GREEN }),
++    scene.tex('\\tfrac{4}{\\pi}\\left(\\sin x+\\tfrac{\\sin 3x}{3}+\\cdots+\\tfrac{\\sin 9x}{9}\\right)', { at: labelAt, size: 42, color: C.YELLOW }),
++    scene.tex('\\tfrac{4}{\\pi}\\sum_{k\\ \\mathrm{odd}\\le 51}\\tfrac{\\sin kx}{k}', { at: labelAt, size: 46, color: C.ORANGE }),
++  ];
++
++  // intro (4 s)
++  scene.play(write(title, { duration: 1.6 }), create(axes, { duration: 1.6 }), fadeIn([piLabel, minusPi], { duration: 1 }));
++  scene.play(create(wave, { duration: 1.5 }), fadeIn(labels[0], { duration: 1, shift: [0, -0.2] }));
++  scene.wait(0.9);
++
++  // build (8 s)
++  const steps = [3, 5, 9, 51];
++  steps.forEach((n, i) => {
++    scene.play(morph(wave, partial(n), { duration: 1.5 }), swap(labels[i], labels[i + 1], { duration: 1.5 }));
++    scene.wait(0.4);
++  });
++  scene.padTo(window.__VIDEO_TOTAL__ ?? scene.cursor);
++  scene.start();
++</script>
++</body>
++</html>
+diff --git a/examples/math-3b1b/storyboard.json b/examples/math-3b1b/storyboard.json
+new file mode 100644
+index 0000000..6cef04d
+--- /dev/null
++++ b/examples/math-3b1b/storyboard.json
+@@ -0,0 +1,6 @@
++{
++  "scenes": [
++    { "id": "intro", "title": "Title and axes", "duration_seconds": 4 },
++    { "id": "build", "title": "Adding harmonics", "duration_seconds": 8 }
++  ]
++}
+diff --git a/examples/three-3d/source/index.html b/examples/three-3d/source/index.html
+new file mode 100644
+index 0000000..0928c1a
+--- /dev/null
++++ b/examples/three-3d/source/index.html
+@@ -0,0 +1,86 @@
++<!doctype html>
++<html>
++<head>
++  <meta charset="utf-8" />
++  <title>3D scene</title>
++  <style>
++    html, body { margin: 0; background: #05060f; overflow: hidden; }
++    canvas { display: block; }
++    #title {
++      position: fixed; left: 0; right: 0; bottom: 90px; text-align: center;
++      font: 600 64px 'DejaVu Sans', Arial, sans-serif; color: #fff; letter-spacing: 2px;
++      text-shadow: 0 4px 30px rgba(88, 196, 221, .8);
++      opacity: 0; animation: rise 1.5s 1s ease-out forwards;
++    }
++    @keyframes rise { from { opacity: 0; transform: translateY(40px); } to { opacity: 1; transform: none; } }
++  </style>
++</head>
++<body>
++<div id="title">Real-time 3D, frame-perfect</div>
++<script type="module">
++  import * as THREE from 'three';
++
++  const width = window.innerWidth;
++  const height = window.innerHeight;
++
++  const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
++  renderer.setPixelRatio(1);
++  renderer.setSize(width, height);
++  document.body.prepend(renderer.domElement);
++
++  const scene = new THREE.Scene();
++  scene.background = new THREE.Color(0x05060f);
++  scene.fog = new THREE.Fog(0x05060f, 8, 22);
++
++  const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
++
++  const knot = new THREE.Mesh(
++    new THREE.TorusKnotGeometry(1, 0.32, 256, 48, 2, 3),
++    new THREE.MeshStandardMaterial({ color: 0x58c4dd, metalness: 0.65, roughness: 0.22 }),
++  );
++  scene.add(knot);
++
++  const colors = [0xfc6255, 0xffff00, 0x83c167, 0xff862f, 0x9a72ac, 0xd147bd];
++  const spheres = colors.map((color) => {
++    const mesh = new THREE.Mesh(
++      new THREE.SphereGeometry(0.22, 48, 32),
++      new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.35, roughness: 0.3 }),
++    );
++    scene.add(mesh);
++    return mesh;
++  });
++
++  const floor = new THREE.GridHelper(40, 60, 0x2a3a5a, 0x151c30);
++  floor.position.y = -2.2;
++  scene.add(floor);
++
++  scene.add(new THREE.AmbientLight(0xffffff, 0.35));
++  const key = new THREE.DirectionalLight(0xffffff, 2.2);
++  key.position.set(4, 6, 5);
++  scene.add(key);
++  const warm = new THREE.PointLight(0xff862f, 60, 20);
++  const cool = new THREE.PointLight(0x58c4dd, 60, 20);
++  scene.add(warm, cool);
++
++  function frame(t) {
++    knot.rotation.set(t * 0.5, t * 0.8, 0);
++    spheres.forEach((mesh, i) => {
++      const a = t * (0.9 + i * 0.12) + (i * Math.PI * 2) / spheres.length;
++      const r = 2.3 + 0.35 * Math.sin(t + i);
++      mesh.position.set(Math.cos(a) * r, Math.sin(a * 1.3 + i) * 0.9, Math.sin(a) * r);
++    });
++    warm.position.set(Math.cos(t * 1.2) * 4, 2, Math.sin(t * 1.2) * 4);
++    cool.position.set(-Math.cos(t * 0.9) * 4, -1, -Math.sin(t * 0.9) * 4);
++    camera.position.set(Math.cos(t * 0.35) * 7, 1.6 + Math.sin(t * 0.5) * 0.8, Math.sin(t * 0.35) * 7);
++    camera.lookAt(0, 0, 0);
++    renderer.render(scene, camera);
++  }
++
++  // The renderer calls this once per video frame with the exact time. (Using
++  // requestAnimationFrame + THREE.Clock also works: the clock is virtual.)
++  window.__renderFrame = (tMs) => frame(tMs / 1000);
++  frame(0);
++  if (!window.__VIDEO_EXPORT__) renderer.setAnimationLoop(() => frame(performance.now() / 1000));
++</script>
++</body>
++</html>
+diff --git a/examples/three-3d/storyboard.json b/examples/three-3d/storyboard.json
+new file mode 100644
+index 0000000..e6f3ad8
+--- /dev/null
++++ b/examples/three-3d/storyboard.json
+@@ -0,0 +1,5 @@
++{
++  "scenes": [
++    { "id": "orbit", "title": "Torus knot and orbiting spheres", "duration_seconds": 8 }
++  ]
++}
+diff --git a/sandbox/Dockerfile b/sandbox/Dockerfile
+index 0ea456f..d1ac418 100644
+--- a/sandbox/Dockerfile
++++ b/sandbox/Dockerfile
+@@ -25,10 +25,15 @@ RUN pip install --no-cache-dir \
+     playwright \
+     pyttsx3
+ 
+-# Chromium comes from apt (render.py passes executable_path), but Playwright's video
+-# recording (record_video_dir) needs its own bundled ffmpeg build. Without this step every
+-# render fails with "Executable doesn't exist at /ms-playwright/ffmpeg-...".
+-RUN playwright install ffmpeg
++# JavaScript libraries that generated videos can use offline. render.py serves them to the
++# page under /vendor/<name>/ and maps `import ... from 'three' | 'gsap' | 'katex' | 'mathkit'`.
++# (Chromium comes from apt; frames are screenshots piped into the system ffmpeg, so Playwright's
++# own browser/ffmpeg downloads are not needed.)
++ENV VIDEO_LIBS_DIR=/opt/lib/node_modules
++RUN mkdir -p /opt/lib && cd /opt/lib \
++    && npm install --omit=dev --no-audit --no-fund --no-package-lock \
++       three@0.186.1 gsap@3.15.0 d3@7.9.0 katex@0.19.0 \
++    && npm cache clean --force
+ 
+ COPY renderer /opt/renderer
+ RUN chmod +x /opt/renderer/*.py
+diff --git a/sandbox/renderer/mathkit/mathkit.js b/sandbox/renderer/mathkit/mathkit.js
+new file mode 100644
+index 0000000..8f506b8
+--- /dev/null
++++ b/sandbox/renderer/mathkit/mathkit.js
+@@ -0,0 +1,638 @@
++/*
++ * mathkit - a small manim-style toolkit for 3Blue1Brown-like explainer videos.
++ *
++ *   import { Scene, COLORS, create, write, fadeIn, fadeOut, morph } from 'mathkit';
++ *
++ * The frame is 16 x 9 "frame units" (like manim): x from -8 to 8, y from -4.5 to 4.5, y up,
++ * origin at the centre. One frame unit = 120 px at 1920x1080.
++ *
++ * Elements are INVISIBLE until introduced: scene.add(el) shows them from the current time,
++ * or an animation (create / fadeIn / write / ...) reveals them. Animations are played one
++ * after another with scene.play(...); animations passed to the same play() run together.
++ *
++ * The scene builds a paused GSAP timeline and exposes it to the renderer through
++ * window.__renderFrame, so rendering is frame-exact. Call scene.start() last.
++ */
++import gsap from 'gsap';
++import katex from 'katex';
++
++export const COLORS = {
++  BLACK: '#000000', WHITE: '#FFFFFF', GREY: '#888888', LIGHT_GREY: '#BBBBBB', DARK_GREY: '#444444',
++  BLUE: '#58C4DD', BLUE_D: '#29ABCA', BLUE_E: '#1C758A', TEAL: '#5CD0B3', GREEN: '#83C167',
++  YELLOW: '#FFFF00', GOLD: '#F0AC5F', ORANGE: '#FF862F', RED: '#FC6255', MAROON: '#C55F73',
++  PURPLE: '#9A72AC', PINK: '#D147BD',
++};
++export const SMOOTH = 'power2.inOut';
++
++const W = 1920;
++const H = 1080;
++export const UNIT = 120; // pixels per frame unit
++export const FRAME = { width: W / UNIT, height: H / UNIT };
++
++const SVG_NS = 'http://www.w3.org/2000/svg';
++const XHTML_NS = 'http://www.w3.org/1999/xhtml';
++const SHAPES = 'path,circle,ellipse,rect,polygon,polyline,line';
++const FONT_SPECS = [
++  '1em KaTeX_Main', 'bold 1em KaTeX_Main', 'italic 1em KaTeX_Main', 'italic 1em KaTeX_Math',
++  '1em KaTeX_AMS', '1em KaTeX_Size1', '1em KaTeX_Size2', '1em KaTeX_Size3', '1em KaTeX_Size4',
++];
++
++// ---------------------------------------------------------------- small utilities
++
++export const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
++export const lerp = (a, b, u) => a + (b - a) * u;
++export const linspace = (a, b, n) => Array.from({ length: n }, (_, i) => a + ((b - a) * i) / (n - 1));
++/** Seeded random numbers in [0,1). Math.random() would make renders differ between runs. */
++export function rng(seed = 1) {
++  let a = seed >>> 0;
++  return () => {
++    a = (a + 0x6d2b79f5) >>> 0;
++    let t = Math.imul(a ^ (a >>> 15), 1 | a);
++    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++  };
++}
++
++const px = (x, y) => [W / 2 + x * UNIT, H / 2 - y * UNIT];
++const num = (v) => +v.toFixed(2);
++
++function svgEl(tag, attrs = {}, parent) {
++  const node = document.createElementNS(SVG_NS, tag);
++  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
++  if (parent) parent.appendChild(node);
++  return node;
++}
++
++const isPaint = (value) => value != null && value !== 'none';
++const shapesOf = (target) => (target.matches && target.matches(SHAPES) ? [target] : [...target.querySelectorAll(SHAPES)]);
++const textsOf = (target) => (target.tagName === 'foreignObject' ? [target] : [...target.querySelectorAll('foreignObject')]);
++
++function tickValues(a, b, step) {
++  const out = [];
++  for (let v = Math.ceil(a / step - 1e-9) * step; v <= b + 1e-9; v += step) out.push(+v.toFixed(10));
++  return out;
++}
++
++/** SVG path data for a list of pixel points; NaN / off-screen values break the line. */
++function curveD(points) {
++  let d = '';
++  let pen = false;
++  for (const [x, y] of points) {
++    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(y) > 4000 || Math.abs(x) > 4000) {
++      pen = false;
++      continue;
++    }
++    d += `${pen ? 'L' : 'M'}${num(x)} ${num(y)}`;
++    pen = true;
++  }
++  return d || 'M0 0';
++}
++
++// ---------------------------------------------------------------- animations
++
++export class Anim {
++  constructor(duration, build) {
++    this.duration = duration;
++    this.build = build; // (timeline, startTime) => void
++  }
++}
++
++/** Draw an element's outline (and fade in its fill / text). */
++export function create(target, { duration = 1, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    tl.set(target, { opacity: 1 }, at);
++    for (const shape of shapesOf(target)) {
++      const hasStroke = isPaint(shape.getAttribute('stroke'));
++      const hasFill = isPaint(shape.getAttribute('fill'));
++      const fillOpacity = shape.getAttribute('fill-opacity') ?? 1;
++      if (hasStroke && !shape.__noDraw) {
++        // Attribute tweens, not CSS: GSAP rounds px-valued CSS properties (stroke-dashoffset,
++        // stroke-width) to whole pixels, which would make the drawing jump instead of glide.
++        tl.fromTo(shape, { attr: { 'stroke-dasharray': 1, 'stroke-dashoffset': 1 } }, { attr: { 'stroke-dashoffset': 0 }, duration, ease }, at);
++        tl.set(shape, { attr: { 'stroke-dasharray': shape.__dash || 'none' } }, at + duration);
++      } else if (hasStroke) {
++        tl.fromTo(shape, { strokeOpacity: 0 }, { strokeOpacity: 1, duration, ease }, at);
++      }
++      if (hasFill) {
++        const lag = hasStroke ? duration / 2 : 0;
++        tl.fromTo(shape, { fillOpacity: 0 }, { fillOpacity: fillOpacity, duration: duration - lag, ease }, at + lag);
++      }
++    }
++    for (const text of textsOf(target)) {
++      tl.fromTo(text, { opacity: 0 }, { opacity: 1, duration: duration / 2, ease }, at + duration / 2);
++    }
++  });
++}
++
++/** Reverse of create. */
++export function uncreate(target, { duration = 1, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    for (const shape of shapesOf(target)) {
++      if (isPaint(shape.getAttribute('stroke')) && !shape.__noDraw) {
++        tl.set(shape, { attr: { 'stroke-dasharray': 1 } }, at);
++        tl.to(shape, { attr: { 'stroke-dashoffset': 1 }, duration, ease }, at);
++      }
++    }
++    tl.to(target, { opacity: 0, duration: duration / 4, ease: 'none' }, at + duration * 0.75);
++  });
++}
++
++export function fadeIn(target, { duration = 0.8, shift = [0, 0], scale = 1, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    const from = { opacity: 0 };
++    const to = { opacity: 1, duration, ease };
++    if (shift[0] || shift[1]) {
++      Object.assign(from, { x: shift[0] * UNIT, y: -shift[1] * UNIT });
++      Object.assign(to, { x: 0, y: 0 });
++    }
++    if (scale !== 1) {
++      Object.assign(from, { scale, transformOrigin: '50% 50%' });
++      Object.assign(to, { scale: 1 });
++    }
++    tl.fromTo(target, from, to, at);
++  });
++}
++
++export function fadeOut(target, { duration = 0.8, shift = [0, 0], ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    const to = { opacity: 0, duration, ease };
++    if (shift[0] || shift[1]) Object.assign(to, { x: `+=${shift[0] * UNIT}`, y: `+=${-shift[1] * UNIT}` });
++    tl.to(target, to, at);
++  });
++}
++
++/** Reveal text / LaTeX from left to right (and create any shapes in the target). */
++export function write(target, { duration = 1.2, ease = 'none' } = {}) {
++  return new Anim(duration, (tl, at) => {
++    tl.set(target, { opacity: 1 }, at);
++    for (const text of textsOf(target)) {
++      const content = text.__content;
++      tl.set(text, { opacity: 1 }, at);
++      tl.fromTo(
++        content,
++        { clipPath: 'inset(-25% 100% -25% 0%)' },
++        { clipPath: 'inset(-25% -3% -25% 0%)', duration, ease },
++        at,
++      );
++    }
++    if (shapesOf(target).length) create(target, { duration })?.build(tl, at);
++  });
++}
++
++/** Move by (dx, dy) frame units (y up). */
++export function shift(target, [dx, dy], { duration = 1, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    tl.to(target, { x: `+=${dx * UNIT}`, y: `+=${-dy * UNIT}`, duration, ease }, at);
++  });
++}
++
++/** Move text / dots / circles to an absolute frame position. */
++export function moveTo(target, [x, y], { duration = 1, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    if (!target.__anchor) throw new Error('moveTo works on text, tex, dot and circle elements; use shift() for others.');
++    const [tx, ty] = px(x, y);
++    const [ax, ay] = target.__anchor;
++    tl.to(target, { x: `+=${tx - ax}`, y: `+=${ty - ay}`, duration, ease }, at);
++    target.__anchor = [tx, ty];
++  });
++}
++
++export function scaleTo(target, factor, { duration = 1, ease = SMOOTH, about } = {}) {
++  return new Anim(duration, (tl, at) => {
++    const origin = about ? px(...about) : target.__anchor;
++    const vars = { scale: factor, duration, ease };
++    if (origin) vars.svgOrigin = `${origin[0]} ${origin[1]}`;
++    else vars.transformOrigin = '50% 50%';
++    tl.to(target, vars, at);
++  });
++}
++
++export function rotate(target, degrees, { duration = 1, ease = SMOOTH, about } = {}) {
++  return new Anim(duration, (tl, at) => {
++    const origin = about ? px(...about) : target.__anchor;
++    const vars = { rotation: `+=${-degrees}`, duration, ease };
++    if (origin) vars.svgOrigin = `${origin[0]} ${origin[1]}`;
++    else vars.transformOrigin = '50% 50%';
++    tl.to(target, vars, at);
++  });
++}
++
++export function colorTo(target, color, { duration = 0.8, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    for (const shape of shapesOf(target)) {
++      const vars = { duration, ease };
++      if (isPaint(shape.getAttribute('stroke'))) vars.stroke = color;
++      if (isPaint(shape.getAttribute('fill'))) vars.fill = color;
++      tl.to(shape, vars, at);
++    }
++    for (const text of textsOf(target)) tl.to(text.__content, { color, duration, ease }, at);
++  });
++}
++
++/** Cross-fade one element into another that sits in the same place. */
++export function swap(from, to, { duration = 0.8, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    tl.to(from, { opacity: 0, duration: duration * 0.45, ease: 'power1.in' }, at);
++    tl.fromTo(to, { opacity: 0 }, { opacity: 1, duration: duration * 0.45, ease: 'power1.out' }, at + duration * 0.55);
++  });
++}
++
++/**
++ * Call fn(u) with u going 0 -> 1 over `duration`. The escape hatch for anything custom,
++ * e.g. counters, moving points, updating shapes.
++ */
++export function custom(duration, fn, { ease = 'none' } = {}) {
++  return new Anim(duration, (tl, at) => {
++    const state = { u: 0 };
++    // immediateRender:false - otherwise building a later tween would apply its start state
++    // right now and clobber the state of earlier ones.
++    tl.fromTo(state, { u: 0 }, { u: 1, duration, ease, immediateRender: false, onUpdate: () => fn(state.u) }, at);
++  });
++}
++
++/** Morph a plot made with axes.plot() into another function (3b1b "Transform"). */
++export function morph(path, fn, { duration = 1.5, ease = SMOOTH } = {}) {
++  return new Anim(duration, (tl, at) => {
++    const plot = path.__plot;
++    if (!plot) throw new Error('morph() needs a path created by axes.plot().');
++    const from = plot.ys.slice();
++    const to = plot.xs.map((x) => fn(x));
++    plot.ys = to;
++    plot.fn = fn;
++    tl.fromTo(
++      { u: 0 },
++      { u: 0 },
++      {
++        u: 1,
++        duration,
++        ease,
++        immediateRender: false,
++        onUpdate() {
++          const u = this.targets()[0].u;
++          path.setAttribute('d', curveD(plot.xs.map((x, i) => plot.axes.c2p(x, lerp(from[i], to[i], u)))));
++        },
++      },
++      at,
++    );
++  });
++}
++
++/** Move a dot along a path: f(u) returns the frame position [x, y] for u in 0..1. */
++export function along(dot, f, { duration = 2, ease = SMOOTH } = {}) {
++  return custom(duration, (u) => {
++    const [x, y] = px(...f(u));
++    dot.setAttribute('cx', num(x));
++    dot.setAttribute('cy', num(y));
++    dot.__anchor = [x, y];
++  }, { ease });
++}
++
++// ---------------------------------------------------------------- scene
++
++export class Scene {
++  constructor({ background = COLORS.BLACK } = {}) {
++    document.documentElement.style.background = background;
++    Object.assign(document.body.style, { margin: '0', overflow: 'hidden', background });
++    this.svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'xMidYMid meet' }, document.body);
++    Object.assign(this.svg.style, { position: 'fixed', inset: '0', width: '100vw', height: '100vh', display: 'block' });
++    this.layer = svgEl('g', {}, this.svg);
++    this.tl = gsap.timeline({ paused: true });
++    this.cursor = 0;
++    this.cam = { cx: 0, cy: 0, scale: 1 };
++    this.started = false;
++
++    const link = document.createElement('link');
++    link.rel = 'stylesheet';
++    link.href = '/vendor/katex/dist/katex.min.css';
++    document.head.appendChild(link);
++    const cssLoaded = new Promise((resolve) => {
++      link.onload = resolve;
++      link.onerror = resolve;
++    });
++    this.ready = cssLoaded.then(() => Promise.all(FONT_SPECS.map((f) => document.fonts.load(f).catch(() => {}))));
++    // The renderer waits for this before capturing the first frame.
++    window.__VIDEO_READY = Promise.all([window.__VIDEO_READY, this.ready]);
++  }
++
++  // ---- timeline ----
++
++  /** Play animations together, then move on once the longest has finished. */
++  play(...anims) {
++    this._autostart();
++    const list = anims.flat().filter(Boolean);
++    let longest = 0;
++    for (const anim of list) {
++      anim.build(this.tl, this.cursor);
++      longest = Math.max(longest, anim.duration);
++    }
++    this.cursor += longest;
++    return this;
++  }
++
++  wait(seconds = 1) {
++    this._autostart();
++    this.cursor += seconds;
++    return this;
++  }
++
++  /** Hold the last frame until `seconds` have passed (use window.__VIDEO_TOTAL__). */
++  padTo(seconds) {
++    if (seconds > this.cursor) this.cursor = seconds;
++    return this;
++  }
++
++  /** Show elements instantly, from the current time on. */
++  add(...els) {
++    for (const el of els.flat()) {
++      if (this.cursor === 0) el.style.opacity = '1';
++      this.tl.set(el, { opacity: 1 }, this.cursor);
++    }
++    return this;
++  }
++
++  remove(...els) {
++    for (const el of els.flat()) this.tl.set(el, { opacity: 0 }, this.cursor);
++    return this;
++  }
++
++  /** Pan / zoom the whole scene. */
++  camera({ center = [0, 0], zoom = 1, duration = 1.5, ease = SMOOTH } = {}) {
++    const from = { ...this.cam };
++    const to = { cx: center[0], cy: center[1], scale: zoom };
++    this.cam = to;
++    const apply = (c) => {
++      const [x, y] = px(c.cx, c.cy);
++      this.layer.setAttribute('transform', `translate(${W / 2} ${H / 2}) scale(${c.scale}) translate(${-x} ${-y})`);
++    };
++    return new Anim(duration, (tl, at) => {
++      tl.fromTo(
++        { u: 0 },
++        { u: 0 },
++        {
++          u: 1,
++          duration,
++          ease,
++          immediateRender: false,
++          onUpdate() {
++            const u = this.targets()[0].u;
++            apply({ cx: lerp(from.cx, to.cx, u), cy: lerp(from.cy, to.cy, u), scale: lerp(from.scale, to.scale, u) });
++          },
++        },
++        at,
++      );
++    });
++  }
++
++  _autostart() {
++    if (this._scheduled) return;
++    this._scheduled = true;
++    setTimeout(() => this.start(), 0);
++  }
++
++  /** Finish building. Call once, after the last play()/wait(). */
++  start() {
++    if (this.started) return this;
++    this.started = true;
++    this.duration = this.cursor;
++    const total = window.__VIDEO_TOTAL__;
++    if (window.__VIDEO_EXPORT__ && total && Math.abs(total - this.cursor) > 0.1) {
++      console.error(
++        `mathkit: the animation lasts ${this.cursor.toFixed(2)}s but the storyboard totals ${total.toFixed(2)}s. ` +
++          'Make them equal (scene.padTo(window.__VIDEO_TOTAL__) holds the last frame).',
++      );
++    }
++    if (window.__VIDEO_EXPORT__) {
++      window.__renderFrame = (tMs) => {
++        this.tl.time(Math.min(tMs / 1000, this.tl.duration()), false);
++      };
++    } else {
++      this.tl.play();
++    }
++    return this;
++  }
++
++  // ---- shapes (frame coordinates, y up) ----
++
++  _shape(tag, attrs, o = {}) {
++    const hasFill = o.fill != null && o.fill !== 'none';
++    const stroke = o.stroke === false ? 'none' : o.color || (hasFill ? o.fill : COLORS.WHITE);
++    const node = svgEl(tag, {
++      ...attrs,
++      stroke,
++      'stroke-width': o.width ?? 4,
++      fill: hasFill ? o.fill : 'none',
++      'fill-opacity': o.fillOpacity ?? 1,
++      'stroke-linecap': 'round',
++      'stroke-linejoin': 'round',
++    }, this.layer);
++    if (o.dashed) {
++      node.setAttribute('stroke-dasharray', '16 12');
++      node.__dash = '16 12';
++      node.__noDraw = true; // pathLength normalisation would rescale the dashes
++    } else {
++      node.setAttribute('pathLength', '1');
++    }
++    node.style.opacity = '0';
++    return node;
++  }
++
++  line(a, b, o = {}) {
++    const [x1, y1] = px(...a);
++    const [x2, y2] = px(...b);
++    return this._shape('path', { d: `M${num(x1)} ${num(y1)}L${num(x2)} ${num(y2)}` }, o);
++  }
++
++  polyline(points, o = {}) {
++    return this._shape('path', { d: curveD(points.map((p) => px(...p))) }, o);
++  }
++
++  polygon(points, o = {}) {
++    return this._shape('path', { d: curveD(points.map((p) => px(...p))) + 'Z' }, o);
++  }
++
++  rect(center, width, height, o = {}) {
++    const [cx, cy] = center;
++    const hw = width / 2;
++    const hh = height / 2;
++    return this.polygon([[cx - hw, cy - hh], [cx + hw, cy - hh], [cx + hw, cy + hh], [cx - hw, cy + hh]], o);
++  }
++
++  circle(center, radius, o = {}) {
++    const [cx, cy] = px(...center);
++    const node = this._shape('circle', { cx: num(cx), cy: num(cy), r: num(radius * UNIT) }, o);
++    node.__anchor = [cx, cy];
++    return node;
++  }
++
++  dot(center, o = {}) {
++    const node = this.circle(center, o.radius ?? 0.09, { fill: o.color || COLORS.WHITE, stroke: false, ...o });
++    return node;
++  }
++
++  /** Circular arc from angle a0 to a1 (radians, counter-clockwise). */
++  arc(center, radius, a0, a1, o = {}) {
++    const pts = linspace(a0, a1, 64).map((a) => [center[0] + radius * Math.cos(a), center[1] + radius * Math.sin(a)]);
++    return this.polyline(pts, o);
++  }
++
++  /** Curve from a function t -> [x, y] in frame coordinates. */
++  parametric(fn, { tRange = [0, 1], samples = 300, ...o } = {}) {
++    return this.polyline(linspace(tRange[0], tRange[1], samples).map((t) => fn(t)), o);
++  }
++
++  arrow(a, b, o = {}) {
++    const g = svgEl('g', {}, this.layer);
++    g.style.opacity = '0';
++    const color = o.color || COLORS.WHITE;
++    const tip = o.tip ?? 0.22;
++    const dx = b[0] - a[0];
++    const dy = b[1] - a[1];
++    const len = Math.hypot(dx, dy) || 1;
++    const ux = dx / len;
++    const uy = dy / len;
++    const base = [b[0] - ux * tip, b[1] - uy * tip];
++    const shaft = this.line(a, base, { color, width: o.width ?? 4 });
++    const head = this.polygon(
++      [b, [base[0] - uy * tip * 0.45, base[1] + ux * tip * 0.45], [base[0] + uy * tip * 0.45, base[1] - ux * tip * 0.45]],
++      { fill: color, color, width: 1 },
++    );
++    for (const part of [shaft, head]) {
++      part.style.opacity = '1';
++      g.appendChild(part);
++    }
++    return g;
++  }
++
++  /** Group elements so they can be animated together. */
++  group(...els) {
++    const g = svgEl('g', {}, this.layer);
++    g.style.opacity = '0';
++    for (const el of els.flat()) {
++      el.style.opacity = '1';
++      g.appendChild(el);
++    }
++    return g;
++  }
++
++  // ---- text ----
++
++  _text(inner, { at = [0, 0], size = 56, color = COLORS.WHITE, anchor = 'center', font = 'serif' } = {}, parent = this.layer) {
++    const [cx, cy] = px(...at);
++    const boxW = 1800;
++    const boxH = 420;
++    const x = anchor === 'left' ? cx : anchor === 'right' ? cx - boxW : cx - boxW / 2;
++    const fo = svgEl('foreignObject', { x: num(x), y: num(cy - boxH / 2), width: boxW, height: boxH }, parent);
++    fo.style.overflow = 'visible';
++    const justify = anchor === 'left' ? 'flex-start' : anchor === 'right' ? 'flex-end' : 'center';
++    const row = document.createElementNS(XHTML_NS, 'div');
++    row.setAttribute('style', `display:flex;align-items:center;justify-content:${justify};width:100%;height:100%`);
++    const content = document.createElementNS(XHTML_NS, 'div');
++    const family = font === 'sans' ? "'DejaVu Sans', Arial, sans-serif" : "KaTeX_Main, 'DejaVu Serif', serif";
++    content.setAttribute(
++      'style',
++      `font-size:${size}px;color:${color};white-space:nowrap;line-height:1.25;text-align:center;font-family:${family}`,
++    );
++    content.innerHTML = inner;
++    row.appendChild(content);
++    fo.appendChild(row);
++    fo.__content = content;
++    fo.__anchor = [cx, cy];
++    fo.style.opacity = '0';
++    return fo;
++  }
++
++  /** Plain text. Use "\n" for new lines. */
++  text(str, o = {}) {
++    const safe = String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
++    return this._text(safe, o);
++  }
++
++  /** LaTeX via KaTeX, e.g. scene.tex('e^{i\\pi}+1=0', { at: [0, 2], color: COLORS.YELLOW }). */
++  tex(latex, o = {}) {
++    const html = katex.renderToString(latex, { throwOnError: false, output: 'html', displayMode: !!o.display });
++    return this._text(html, o);
++  }
++
++  // ---- coordinate system ----
++
++  /**
++   * Axes (optionally a full number plane with grid: true).
++   * xRange / yRange are [min, max, step]. By default the axes are centred in the frame; pass
++   * center: [x, y] to move them, or xLength / yLength (frame units) to scale them.
++   * Returns a group with helpers: c2p(x, y) -> frame position, plot(fn), point(x, y),
++   * vector([x, y]), area(fn, [a, b]).
++   */
++  axes(o = {}) {
++    const {
++      xRange = [-4, 4, 1], yRange = [-3, 3, 1], color = COLORS.GREY, width = 3, labels = false,
++      grid = false, arrows = true, center = [0, 0], xLabel, yLabel, labelSize = 26,
++    } = o;
++    const [x0, x1, xStep] = xRange;
++    const [y0, y1, yStep] = yRange;
++    const xUnit = o.xLength ? o.xLength / (x1 - x0) : 1;
++    const yUnit = o.yLength ? o.yLength / (y1 - y0) : 1;
++    const ox = o.origin ? o.origin[0] : center[0] - ((x0 + x1) / 2) * xUnit;
++    const oy = o.origin ? o.origin[1] : center[1] - ((y0 + y1) / 2) * yUnit;
++    const c2f = (cx, cy) => [ox + cx * xUnit, oy + cy * yUnit];
++    const c2p = c2f; // frame coordinates are what every builder accepts
++    const axisY = clamp(0, y0, y1);
++    const axisX = clamp(0, x0, x1);
++
++    const g = svgEl('g', {}, this.layer);
++    g.style.opacity = '0';
++    const part = (node) => {
++      node.style.opacity = '1';
++      g.appendChild(node);
++      return node;
++    };
++
++    if (grid) {
++      for (const v of tickValues(x0, x1, xStep)) part(this.line(c2f(v, y0), c2f(v, y1), { color: COLORS.BLUE_E, width: 2 })).setAttribute('stroke-opacity', '0.45');
++      for (const v of tickValues(y0, y1, yStep)) part(this.line(c2f(x0, v), c2f(x1, v), { color: COLORS.BLUE_E, width: 2 })).setAttribute('stroke-opacity', '0.45');
++    }
++    part(this.line(c2f(x0, axisY), c2f(x1, axisY), { color, width }));
++    part(this.line(c2f(axisX, y0), c2f(axisX, y1), { color, width }));
++    if (arrows) {
++      const tip = 0.16;
++      part(this.polygon([c2f(x1, axisY), [c2f(x1, axisY)[0] - tip, oy + axisY * yUnit + tip * 0.45], [c2f(x1, axisY)[0] - tip, oy + axisY * yUnit - tip * 0.45]], { fill: color, color, width: 1 }));
++      part(this.polygon([c2f(axisX, y1), [ox + axisX * xUnit - tip * 0.45, c2f(axisX, y1)[1] - tip], [ox + axisX * xUnit + tip * 0.45, c2f(axisX, y1)[1] - tip]], { fill: color, color, width: 1 }));
++    }
++    const tickLen = 0.08;
++    for (const v of tickValues(x0, x1, xStep)) {
++      if (Math.abs(v - axisX) < 1e-9) continue;
++      const [fx, fy] = c2f(v, axisY);
++      part(this.line([fx, fy - tickLen], [fx, fy + tickLen], { color, width }));
++      if (labels) this._text(katex.renderToString(String(+v.toFixed(6)), { output: 'html' }), { at: [fx, fy - 0.3], size: labelSize, color }, g).style.opacity = '1';
++    }
++    for (const v of tickValues(y0, y1, yStep)) {
++      if (Math.abs(v - axisY) < 1e-9) continue;
++      const [fx, fy] = c2f(axisX, v);
++      part(this.line([fx - tickLen, fy], [fx + tickLen, fy], { color, width }));
++      if (labels) this._text(katex.renderToString(String(+v.toFixed(6)), { output: 'html' }), { at: [fx - 0.35, fy], size: labelSize, color }, g).style.opacity = '1';
++    }
++    if (xLabel) this._text(katex.renderToString(xLabel, { output: 'html' }), { at: [c2f(x1, axisY)[0] + 0.3, c2f(x1, axisY)[1] - 0.05], size: 34, color }, g).style.opacity = '1';
++    if (yLabel) this._text(katex.renderToString(yLabel, { output: 'html' }), { at: [c2f(axisX, y1)[0] + 0.05, c2f(axisX, y1)[1] + 0.3], size: 34, color }, g).style.opacity = '1';
++
++    const api = { c2f, c2p };
++    g.c2f = c2f;
++    g.c2p = c2p;
++    g.plot = (fn, po = {}) => {
++      const [a, b] = po.xRange || [x0, x1];
++      const xs = linspace(a, b, po.samples || 400);
++      const ys = xs.map((x) => fn(x));
++      const path = this._shape('path', { d: curveD(xs.map((x, i) => px(...c2f(x, ys[i])))) }, { color: po.color || COLORS.BLUE, width: po.width ?? 5 });
++      path.__plot = { xs, ys, fn, axes: { c2p: (cx, cy) => px(...c2f(cx, cy)) } };
++      return path;
++    };
++    g.area = (fn, [a, b], ao = {}) => {
++      const xs = linspace(a, b, ao.samples || 200);
++      const pts = [c2f(a, 0), ...xs.map((x) => c2f(x, fn(x))), c2f(b, 0)];
++      return this.polygon(pts, { fill: ao.color || COLORS.BLUE, fillOpacity: ao.opacity ?? 0.4, stroke: false });
++    };
++    g.point = (cx, cy, po = {}) => this.dot(c2f(cx, cy), po);
++    g.vector = (v, vo = {}) => this.arrow(c2f(0, 0), c2f(v[0], v[1]), { color: COLORS.YELLOW, ...vo });
++    g.line = (a, b, lo = {}) => this.line(c2f(...a), c2f(...b), lo);
++    Object.assign(api, g);
++    return g;
++  }
++}
+diff --git a/sandbox/renderer/render.py b/sandbox/renderer/render.py
+index 53c9614..da2b6fa 100644
+--- a/sandbox/renderer/render.py
++++ b/sandbox/renderer/render.py
+@@ -1,20 +1,72 @@
++"""Deterministic frame-by-frame renderer.
++
++The project is served from a small HTTP server inside the sandbox (loopback only; the
++container has no network). Every page gets a virtual clock (runtime.js). For each video
++frame the clock is advanced by 1/fps, the page is captured as a PNG, and the PNGs are
++piped into ffmpeg together with the narration audio.
++
++Compared with recording the browser in real time this gives exact fps, no dropped frames
++for heavy WebGL/3D scenes, higher quality, and identical output on every run.
++"""
+ import argparse
++import base64
+ import json
++import mimetypes
++import os
++import re
+ import subprocess
++import sys
++import tempfile
++import threading
+ import time
+ import wave
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
++from urllib.parse import unquote, urlparse
+ 
+-# Extra seconds recorded after the storyboard ends so trimming to the exact length never
+-# cuts the last frames short.
+-TAIL_SECONDS = 0.5
++HERE = Path(__file__).resolve().parent
++MAX_BROWSER_MESSAGES = 20
++READY_TIMEOUT_MS = 60_000
+ # Narration starts this long after its scene starts, so the scene's cross-fade and first
+ # entrance animations finish before the voice begins. Keep in sync with app/validation.py.
+ NARRATION_LEAD_SECONDS = 0.6
+ # Tolerated overlap between consecutive clips / the end of the video (float noise).
+ OVERLAP_EPSILON = 0.05
+-MAX_BROWSER_MESSAGES = 20
+ 
++# JS libraries available to every project under /vendor/<name>/... (no CDN needed).
++DEFAULT_LIBS_DIR = "/opt/lib/node_modules"
++
++IMPORT_MAP = {
++    "imports": {
++        "three": "/vendor/three/build/three.module.js",
++        "three/addons/": "/vendor/three/examples/jsm/",
++        "gsap": "/vendor/gsap/index.js",
++        "gsap/": "/vendor/gsap/",
++        "katex": "/vendor/katex/dist/katex.mjs",
++        "mathkit": "/vendor/mathkit/mathkit.js",
++    }
++}
++
++EXTRA_MIME = {
++    ".js": "text/javascript",
++    ".mjs": "text/javascript",
++    ".css": "text/css",
++    ".json": "application/json",
++    ".svg": "image/svg+xml",
++    ".wasm": "application/wasm",
++    ".woff": "font/woff",
++    ".woff2": "font/woff2",
++    ".ttf": "font/ttf",
++    ".otf": "font/otf",
++    ".glb": "model/gltf-binary",
++    ".gltf": "model/gltf+json",
++    ".wav": "audio/wav",
++    ".mp4": "video/mp4",
++    ".webm": "video/webm",
++}
++
++
++# ------------------------------------------------------------------ storyboard / audio
+ 
+ def load_storyboard(root: Path):
+     path = root / "storyboard.json"
+@@ -86,12 +138,14 @@ def plan_audio(project: Path, scenes):
+     return [(clip, begin) for clip, begin, _ in tracks]
+ 
+ 
+-def build_ffmpeg_cmd(src: Path, dst: Path, fps: int, total: float, offset: float, tracks):
+-    cmd = ["ffmpeg", "-y"]
+-    if offset > 0:
+-        # Input option: drops the blank lead-in before the page timeline began.
+-        cmd += ["-ss", f"{offset:.3f}"]
+-    cmd += ["-i", str(src)]
++# ------------------------------------------------------------------ ffmpeg
++
++def build_ffmpeg_cmd(dst: Path, fps: int, total: float, tracks):
++    """ffmpeg command that reads PNG frames from stdin and mixes the narration tracks."""
++    cmd = [
++        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
++        "-f", "image2pipe", "-framerate", str(fps), "-vcodec", "png", "-i", "-",
++    ]
+     for clip, _ in tracks:
+         cmd += ["-i", str(clip)]
+ 
+@@ -118,10 +172,13 @@ def build_ffmpeg_cmd(src: Path, dst: Path, fps: int, total: float, offset: float
+         cmd += ["-map", "0:v:0", "-an"]
+ 
+     cmd += [
++        # Screenshots are full-range sRGB; players expect limited-range BT.709 for HD video.
++        # Converting explicitly keeps colours (and pure black backgrounds) correct.
++        "-vf", "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p",
++        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+         "-c:v", "libx264",
+         "-preset", "medium",
+-        "-crf", "18",
+-        "-pix_fmt", "yuv420p",
++        "-crf", "16",
+         "-r", str(fps),
+         "-t", f"{total:.3f}",
+         "-movflags", "+faststart",
+@@ -130,14 +187,224 @@ def build_ffmpeg_cmd(src: Path, dst: Path, fps: int, total: float, offset: float
+     return cmd
+ 
+ 
+-def encode(src: Path, dst: Path, fps: int, total: float, offset: float, tracks):
+-    completed = subprocess.run(
+-        build_ffmpeg_cmd(src, dst, fps, total, offset, tracks),
+-        capture_output=True,
+-        text=True,
+-    )
+-    if completed.returncode != 0:
+-        raise RuntimeError(completed.stderr[-3000:])
++class Encoder:
++    """Streams PNG frames into ffmpeg."""
++
++    def __init__(self, dst: Path, fps: int, total: float, tracks):
++        self._log = tempfile.TemporaryFile()
++        self._proc = subprocess.Popen(
++            build_ffmpeg_cmd(dst, fps, total, tracks),
++            stdin=subprocess.PIPE,
++            stdout=subprocess.DEVNULL,
++            stderr=self._log,
++        )
++
++    def _error(self) -> str:
++        self._log.seek(0)
++        return self._log.read().decode("utf-8", "replace")[-3000:]
++
++    def write(self, png: bytes):
++        try:
++            self._proc.stdin.write(png)
++        except (BrokenPipeError, OSError) as exc:
++            self._proc.wait()
++            raise RuntimeError(f"ffmpeg stopped accepting frames:\n{self._error()}") from exc
++
++    def close(self):
++        try:
++            self._proc.stdin.close()
++        except (BrokenPipeError, OSError):
++            pass
++        code = self._proc.wait()
++        if code != 0:
++            raise RuntimeError(f"ffmpeg failed (exit {code}):\n{self._error()}")
++
++    def abort(self):
++        try:
++            self._proc.kill()
++        except OSError:
++            pass
++        self._proc.wait()
++
++
++# ------------------------------------------------------------------ HTTP server
++
++def vendor_dirs() -> dict:
++    libs = Path(os.environ.get("VIDEO_LIBS_DIR", DEFAULT_LIBS_DIR))
++    return {
++        "three": libs / "three",
++        "gsap": libs / "gsap",
++        "d3": libs / "d3",
++        "katex": libs / "katex",
++        "mathkit": HERE / "mathkit",
++    }
++
++
++def inject_import_map(html: bytes) -> bytes:
++    """Add the import map unless the page ships its own, so `import ... from 'three'` works."""
++    text = html.decode("utf-8", "replace")
++    if "importmap" in text:
++        return html
++    tag = '<script type="importmap">' + json.dumps(IMPORT_MAP) + "</script>"
++    match = re.search(r"<head[^>]*>", text, re.IGNORECASE)
++    if match:
++        text = text[: match.end()] + tag + text[match.end():]
++    else:
++        text = tag + text
++    return text.encode("utf-8")
++
++
++def _inside(base: Path, target: Path) -> bool:
++    try:
++        target.relative_to(base)
++        return True
++    except ValueError:
++        return False
++
++
++def make_handler(project: Path, vendor: dict):
++    project = project.resolve()
++    vendor = {k: v.resolve() for k, v in vendor.items() if v.exists()}
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = "HTTP/1.1"
++
++        def log_message(self, *args):
++            pass
++
++        def _resolve(self):
++            rel = unquote(urlparse(self.path).path).lstrip("/")
++            if rel.startswith("vendor/"):
++                parts = rel.split("/", 2)
++                base = vendor.get(parts[1])
++                sub = parts[2] if len(parts) > 2 else ""
++            else:
++                base, sub = project, rel
++            if base is None:
++                return None
++            target = (base / sub).resolve()
++            if target.is_dir():
++                target = target / "index.html"
++            if not _inside(base, target) or not target.is_file():
++                return None
++            return target
++
++        def _send(self, with_body: bool):
++            target = self._resolve()
++            if target is None and urlparse(self.path).path == "/favicon.ico":
++                self.send_response(204)  # browsers always ask; don't log it as an error
++                self.send_header("Content-Length", "0")
++                self.end_headers()
++                return
++            if target is None:
++                body = b"not found"
++                self.send_response(404)
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                if with_body:
++                    self.wfile.write(body)
++                return
++
++            ctype = EXTRA_MIME.get(target.suffix.lower()) or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
++            if target.suffix.lower() in {".html", ".htm"}:
++                data = inject_import_map(target.read_bytes())
++                ctype = "text/html; charset=utf-8"
++            else:
++                data = None
++            size = len(data) if data is not None else target.stat().st_size
++
++            start, end, status = 0, size - 1, 200
++            range_header = self.headers.get("Range")
++            if range_header and (m := re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())):
++                if m.group(1) == "" and m.group(2):
++                    start = max(0, size - int(m.group(2)))
++                else:
++                    start = int(m.group(1) or 0)
++                    end = int(m.group(2)) if m.group(2) else size - 1
++                end = min(end, size - 1)
++                if start <= end:
++                    status = 206
++
++            length = end - start + 1
++            self.send_response(status)
++            self.send_header("Content-Type", ctype)
++            self.send_header("Accept-Ranges", "bytes")
++            self.send_header("Content-Length", str(length))
++            self.send_header("Cache-Control", "no-store")
++            if status == 206:
++                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
++            self.end_headers()
++            if not with_body:
++                return
++            if data is not None:
++                self.wfile.write(data[start:end + 1])
++            else:
++                with open(target, "rb") as f:
++                    f.seek(start)
++                    remaining = length
++                    while remaining > 0:
++                        chunk = f.read(min(1 << 20, remaining))
++                        if not chunk:
++                            break
++                        self.wfile.write(chunk)
++                        remaining -= len(chunk)
++
++        def do_GET(self):
++            try:
++                self._send(True)
++            except (BrokenPipeError, ConnectionResetError):
++                pass
++
++        def do_HEAD(self):
++            try:
++                self._send(False)
++            except (BrokenPipeError, ConnectionResetError):
++                pass
++
++    return Handler
++
++
++def start_server(project: Path, vendor: dict | None = None):
++    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(project, vendor or vendor_dirs()))
++    server.daemon_threads = True
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    return server
++
++
++# ------------------------------------------------------------------ browser
++
++CHROMIUM_ARGS = [
++    "--no-sandbox",
++    "--disable-dev-shm-usage",
++    # No GPU in the container: use the software (SwiftShader) WebGL implementation.
++    "--use-gl=angle",
++    "--use-angle=swiftshader",
++    "--enable-unsafe-swiftshader",
++    "--ignore-gpu-blocklist",
++    "--enable-webgl",
++    # Stable, resolution-independent text and colours.
++    "--font-render-hinting=none",
++    "--force-color-profile=srgb",
++    "--hide-scrollbars",
++    "--autoplay-policy=no-user-gesture-required",
++]
++
++
++def chromium_path() -> str | None:
++    """Chromium binary: $CHROMIUM_PATH, else the apt one in the sandbox image."""
++    return os.environ.get("CHROMIUM_PATH") or "/usr/bin/chromium"
++
++
++WAIT_READY_JS = """async (timeoutMs) => {
++  const real = window.__vclock.realSetTimeout;
++  const timeout = new Promise((_, reject) => real(() => reject(new Error('window.__VIDEO_READY did not resolve in time')), timeoutMs));
++  const settle = async () => {
++    if (window.__VIDEO_READY) await window.__VIDEO_READY;
++    await document.fonts.ready;
++    await Promise.all([...document.images].map((img) => img.decode().catch(() => {})));
++  };
++  await Promise.race([settle(), timeout]);
++}"""
+ 
+ 
+ def render(project: Path, width: int, height: int, fps: int):
+@@ -150,94 +417,94 @@ def render(project: Path, width: int, height: int, fps: int):
+ 
+     storyboard, total = load_storyboard(project)
+     tracks = plan_audio(project, storyboard["scenes"])
++    frames = max(1, round(total * fps))
+ 
+     out_dir = project / "renders" / "final"
+     out_dir.mkdir(parents=True, exist_ok=True)
+     mp4 = out_dir / "final.mp4"
++    mp4.unlink(missing_ok=True)
+ 
+-    # Surface what went wrong inside the page (blocked remote scripts, missing assets,
+-    # JS errors) so a blank video can be diagnosed instead of silently "succeeding".
++    # Surface what went wrong inside the page (missing assets, JS errors) so a blank or
++    # broken video can be diagnosed instead of silently "succeeding".
+     browser_messages = []
+ 
+     def note(kind, text):
+         if len(browser_messages) < MAX_BROWSER_MESSAGES:
+             browser_messages.append(f"{kind}: {str(text)[:300]}")
+ 
+-    with sync_playwright() as p:
+-        browser = p.chromium.launch(
+-            executable_path="/usr/bin/chromium",
+-            headless=True,
+-            args=[
+-                "--no-sandbox",
+-                "--disable-dev-shm-usage",
+-                "--disable-gpu",
+-                # Needed for ES module scripts / XHR between local files under file://.
+-                "--allow-file-access-from-files",
+-            ],
+-        )
+-
+-        scenes_json = json.dumps(
+-            [{"id": sc.get("id"), "duration": float(sc["duration_seconds"])} for sc in storyboard["scenes"]]
+-        )
+-        context = browser.new_context(
+-            viewport={"width": width, "height": height},
+-            record_video_dir=str(out_dir),
+-            record_video_size={"width": width, "height": height},
+-            device_scale_factor=1,
+-        )
+-        # Defined before any page script runs, so pages can read them at load time.
+-        context.add_init_script(
+-            script=(
+-                "window.__VIDEO_EXPORT__ = true;"
+-                f"window.__VIDEO_FPS__ = {int(fps)};"
+-                f"window.__VIDEO_TOTAL__ = {float(total)};"
+-                # Scene ids + durations from storyboard.json: the page's scene engine
+-                # (kit.js) reads these, so HTML timing cannot disagree with the storyboard.
+-                f"window.__VIDEO_SCENES__ = {scenes_json};"
++    runtime_js = (HERE / "runtime.js").read_text(encoding="utf-8")
++    scenes_json = json.dumps(
++        [{"id": sc.get("id"), "duration": float(sc["duration_seconds"])} for sc in storyboard["scenes"]]
++    )
++    server = start_server(project)
++    port = server.server_address[1]
++    encoder = Encoder(mp4, fps, total, tracks)
++    started = time.monotonic()
++
++    try:
++        with sync_playwright() as p:
++            browser = p.chromium.launch(
++                executable_path=chromium_path(), headless=True, args=CHROMIUM_ARGS
++            )
++            context = browser.new_context(
++                viewport={"width": width, "height": height}, device_scale_factor=1
++            )
++            context.add_init_script(
++                script=(
++                    "window.__VIDEO_EXPORT__ = true;"
++                    f"window.__VIDEO_FPS__ = {int(fps)};"
++                    f"window.__VIDEO_TOTAL__ = {float(total)};"
++                    f"window.__VIDEO_FRAMES__ = {int(frames)};"
++                    f"window.__VIDEO_WIDTH__ = {int(width)};"
++                    f"window.__VIDEO_HEIGHT__ = {int(height)};"
++                    # Scene ids + durations from storyboard.json: the page's scene engine
++                    # (kit.js) reads these, so HTML timing cannot disagree with the storyboard.
++                    f"window.__VIDEO_SCENES__ = {scenes_json};"
++                )
++                + runtime_js
++            )
++            page = context.new_page()
++            page.on("console", lambda m: note("console.error", m.text) if m.type == "error" else None)
++            page.on("pageerror", lambda e: note("pageerror", e))
++            page.on("requestfailed", lambda r: note("requestfailed", f"{r.url} ({r.failure})"))
++            page.on(
++                "response",
++                lambda r: note("http %d" % r.status, r.url) if r.status >= 400 else None,
+             )
+-        )
+ 
+-        page = context.new_page()
+-        t_page = time.monotonic()  # the recording starts with the page
+-        page.on("console", lambda m: note("console.error", m.text) if m.type == "error" else None)
+-        page.on("pageerror", lambda e: note("pageerror", e))
+-        page.on("requestfailed", lambda r: note("requestfailed", f"{r.url} ({r.failure})"))
+-
+-        page.goto(html.as_uri(), wait_until="load")
+-        page.wait_for_function("document.fonts ? document.fonts.status === 'loaded' : true")
+-
+-        # performance.now() is the time since navigation began, i.e. how far into the
+-        # page's own timeline we are. That pins down where the page timeline starts on
+-        # the recording, so trimming and audio line up with the animations.
+-        perf_now_ms = page.evaluate("performance.now()")
+-        nav_start = time.monotonic() - perf_now_ms / 1000.0
+-        remaining = (nav_start + total + TAIL_SECONDS) - time.monotonic()
+-        page.wait_for_timeout(max(0, int(remaining * 1000)))
+-
+-        video_path = Path(page.video.path()) if page.video else None
+-        context.close()
+-        browser.close()
+-
+-    offset = nav_start - t_page
+-    if not (0 <= offset <= 10):
+-        offset = 0.0  # implausible measurement: don't trim at all
+-
+-    if video_path is None or not video_path.exists():
+-        # Fallback: newest WebM in the output directory.
+-        candidates = sorted(out_dir.glob("*.webm"), key=lambda q: q.stat().st_mtime, reverse=True)
+-        if not candidates:
+-            raise RuntimeError("Browser did not produce a WebM recording.")
+-        video_path = candidates[0]
+-
+-    encode(video_path, mp4, fps, total, offset, tracks)
+-    video_path.unlink(missing_ok=True)
++            page.goto(f"http://127.0.0.1:{port}/source/index.html", wait_until="load")
++            page.evaluate(WAIT_READY_JS, READY_TIMEOUT_MS)
++            # First tick: runs initial rAF callbacks / timers due at t=0 and lays the page
++            # out, which is when any web fonts actually start loading.
++            page.evaluate("() => window.__vclock.advance(0, 0)")
++            page.evaluate(WAIT_READY_JS, READY_TIMEOUT_MS)
++
++            cdp = context.new_cdp_session(page)
++            for i in range(frames):
++                if i > 0:
++                    page.evaluate("([t, i]) => window.__vclock.advance(t, i)", [i * 1000.0 / fps, i])
++                shot = cdp.send("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True})
++                encoder.write(base64.b64decode(shot["data"]))
++                if frames >= 20 and i % max(1, frames // 10) == 0:
++                    print(f"frame {i}/{frames}", file=sys.stderr, flush=True)
++
++            context.close()
++            browser.close()
++        encoder.close()
++    except BaseException:
++        encoder.abort()
++        raise
++    finally:
++        server.shutdown()
+ 
+     print(json.dumps({
+         "ok": True,
+         "duration_seconds": total,
++        "frames": frames,
++        "fps": fps,
++        "render_seconds": round(time.monotonic() - started, 1),
+         "output": str(mp4),
+         "audio": [{"file": clip.name, "start_seconds": round(start, 3)} for clip, start in tracks],
+-        "trim_offset_seconds": round(offset, 3),
+         "browser_messages": browser_messages,
+     }))
+ 
+diff --git a/sandbox/renderer/runtime.js b/sandbox/renderer/runtime.js
+new file mode 100644
+index 0000000..069475f
+--- /dev/null
++++ b/sandbox/renderer/runtime.js
+@@ -0,0 +1,156 @@
++/*
++ * Virtual clock, injected into every page BEFORE its own scripts run.
++ *
++ * The renderer captures a video one frame at a time. For that to be deterministic (same
++ * output every run, no dropped frames however heavy the scene is), page time must not be
++ * the wall clock. This file replaces every time source with a clock that only moves when
++ * the renderer calls window.__vclock.advance(tMs):
++ *
++ *   - performance.now(), Date.now(), new Date()
++ *   - requestAnimationFrame / cancelAnimationFrame
++ *   - setTimeout / setInterval / clearTimeout / clearInterval
++ *   - CSS animations, CSS transitions and Web Animations (paused and seeked every frame)
++ *
++ * So GSAP, three.js (THREE.Clock), anime.js, d3 transitions, CSS keyframes, etc. just work.
++ *
++ * Pages can opt into full control by defining  window.__renderFrame(tMs, frameIndex)  (it
++ * may be async). It is called after every advance, once per captured frame.
++ * A page that loads things asynchronously can set  window.__VIDEO_READY = <Promise>  and
++ * the renderer waits for it before capturing the first frame.
++ *
++ * Time starts at 0 when the page loads and is frozen until the first advance().
++ */
++(() => {
++  if (window.__vclock) return;
++
++  const realSetTimeout = window.setTimeout.bind(window);
++  const BASE_EPOCH = 1735689600000; // 2025-01-01T00:00:00Z: a fixed wall-clock start
++
++  const S = { t: 0, nextId: 1, seq: 0, raf: new Map(), timers: new Map() };
++
++  // ---- Date / performance.now -------------------------------------------------------
++  const NativeDate = Date;
++  class VirtualDate extends NativeDate {
++    constructor(...args) {
++      if (args.length === 0) super(BASE_EPOCH + S.t);
++      else super(...args);
++    }
++    static now() {
++      return BASE_EPOCH + S.t;
++    }
++  }
++  window.Date = VirtualDate;
++  performance.now = () => S.t;
++
++  // ---- requestAnimationFrame --------------------------------------------------------
++  window.requestAnimationFrame = (cb) => {
++    const id = S.nextId++;
++    S.raf.set(id, cb);
++    return id;
++  };
++  window.cancelAnimationFrame = (id) => {
++    S.raf.delete(id);
++  };
++
++  // ---- timers -----------------------------------------------------------------------
++  function addTimer(cb, delay, args, repeat) {
++    if (typeof cb !== 'function') {
++      const code = String(cb);
++      cb = () => (0, eval)(code);
++    }
++    delay = Math.max(1, Number(delay) || 0); // >= 1 ms (like browsers' nested clamp) so a 0 ms re-arming timer cannot spin forever
++    const id = S.nextId++;
++    S.timers.set(id, { cb, args, due: S.t + delay, seq: S.seq++, repeat: repeat ? Math.max(1, delay) : 0 });
++    return id;
++  }
++  window.setTimeout = (cb, delay, ...args) => addTimer(cb, delay, args, false);
++  window.setInterval = (cb, delay, ...args) => addTimer(cb, delay, args, true);
++  window.clearTimeout = window.clearInterval = (id) => {
++    S.timers.delete(id);
++  };
++
++  // Errors inside callbacks must still reach window.onerror (the renderer reports them),
++  // but must not stop the clock.
++  function rethrowAsync(error) {
++    realSetTimeout(() => {
++      throw error;
++    }, 0);
++  }
++
++  // ---- CSS animations / transitions / Web Animations --------------------------------
++  const born = new WeakMap();
++  function syncAnimations() {
++    if (!document.getAnimations) return;
++    for (const animation of document.getAnimations()) {
++      if (!born.has(animation)) born.set(animation, S.t);
++      try {
++        animation.pause();
++        animation.currentTime = S.t - born.get(animation);
++      } catch (error) {
++        /* an animation may be cancelled while we iterate */
++      }
++    }
++  }
++
++  // ---- advancing --------------------------------------------------------------------
++  async function advance(t, frame) {
++    if (t < S.t) throw new Error(`virtual time cannot go backwards (${t} < ${S.t})`);
++
++    // 1. timers that fall due, in order, each seeing its own due time as "now"
++    for (let guard = 0; guard < 100000; guard++) {
++      let nextId = null;
++      let next = null;
++      for (const [id, timer] of S.timers) {
++        if (timer.due > t) continue;
++        if (!next || timer.due < next.due || (timer.due === next.due && timer.seq < next.seq)) {
++          next = timer;
++          nextId = id;
++        }
++      }
++      if (!next) break;
++      S.t = Math.max(S.t, next.due);
++      if (next.repeat) {
++        next.due += next.repeat;
++        next.seq = S.seq++;
++      } else {
++        S.timers.delete(nextId);
++      }
++      try {
++        next.cb(...next.args);
++      } catch (error) {
++        rethrowAsync(error);
++      }
++    }
++    S.t = t;
++
++    // 2. animations, then animation-frame callbacks (which may start new animations)
++    syncAnimations();
++    const callbacks = [...S.raf.values()];
++    S.raf.clear();
++    for (const cb of callbacks) {
++      try {
++        cb(t);
++      } catch (error) {
++        rethrowAsync(error);
++      }
++    }
++
++    // 3. optional page-driven rendering
++    if (typeof window.__renderFrame === 'function') {
++      try {
++        const result = window.__renderFrame(t, frame);
++        // Only await real Promises: a GSAP timeline is "thenable" (tl.then resolves when the
++        // timeline finishes), so `__renderFrame = t => tl.time(t)` must not be awaited.
++        if (result instanceof Promise) await result;
++      } catch (error) {
++        rethrowAsync(error);
++      }
++    }
++
++    // 4. let promise continuations run, then catch animations created by them
++    await new Promise((resolve) => realSetTimeout(resolve, 0));
++    syncAnimations();
++  }
++
++  window.__vclock = { advance, now: () => S.t, realSetTimeout };
++})();
+diff --git a/scripts/cli.py b/scripts/cli.py
+index 24532ba..95dd7ee 100644
+--- a/scripts/cli.py
++++ b/scripts/cli.py
+@@ -7,7 +7,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ 
+ from app.project import create_project, load_project
+ from app.agent import run_agent
+-from app.tools import validate, render, ingest_host_asset
++from app.tools import validate, render, ingest_host_asset, generate_narration, write_source, write_storyboard
++from app.project import require_project_dir
++
++EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+ 
+ parser = argparse.ArgumentParser(description="AI Video Compiler CLI")
+ sub = parser.add_subparsers(dest="cmd", required=True)
+@@ -37,6 +40,9 @@ a.add_argument("asset_type", choices=["image", "video", "audio", "font", "model3
+ a.add_argument("path")
+ a.add_argument("--name", default=None)
+ 
++e = sub.add_parser("example", help="create a project from examples/<name> (e.g. math-3b1b, three-3d, cartoon-explainer)")
++e.add_argument("name", nargs="?", default=None)
++
+ args = parser.parse_args()
+ 
+ if args.cmd == "create":
+@@ -51,3 +57,19 @@ elif args.cmd == "show":
+     print(json.dumps(load_project(args.project_id), indent=2))
+ elif args.cmd == "add-asset":
+     print(json.dumps(ingest_host_asset(args.project_id, args.asset_type, args.path, args.name), indent=2))
++elif args.cmd == "example":
++    available = sorted(d.name for d in EXAMPLES_DIR.iterdir() if (d / "storyboard.json").is_file()) if EXAMPLES_DIR.is_dir() else []
++    if not args.name or args.name not in available:
++        sys.exit("Available examples: " + ", ".join(available))
++    src = EXAMPLES_DIR / args.name
++    project = create_project(f"Example: {args.name}")
++    pid = project["id"]
++    root = require_project_dir(pid)
++    for f in sorted((src / "source").rglob("*")):
++        if f.is_file():
++            write_source(pid, f.relative_to(src / "source").as_posix(), f.read_text(encoding="utf-8"))
++    write_storyboard(pid, json.loads((src / "storyboard.json").read_text(encoding="utf-8")))
++    # Narration scripts (narration/*.txt) are turned into audio in the sandbox (needs Docker).
++    for txt in sorted((src / "narration").glob("*.txt")) if (src / "narration").is_dir() else []:
++        generate_narration(pid, txt.stem + ".wav", txt.read_text(encoding="utf-8"))
++    print(json.dumps({"project_id": pid, "next": f"python scripts/cli.py render {pid}"}, indent=2))
+diff --git a/tests/test_renderer.py b/tests/test_renderer.py
+index 3473e57..3d1ba45 100644
+--- a/tests/test_renderer.py
++++ b/tests/test_renderer.py
+@@ -124,20 +124,18 @@ def test_plan_audio_rejects_missing_referenced_clip(tmp_path):
+ # ------------------------------------------------------------------ ffmpeg command
+ 
+ def test_ffmpeg_cmd_without_audio_is_silent_and_trimmed(tmp_path):
+-    cmd = render.build_ffmpeg_cmd(tmp_path / "in.webm", tmp_path / "out.mp4", 30, 8.0, 0.4, [])
++    cmd = render.build_ffmpeg_cmd(tmp_path / "out.mp4", 30, 8.0, [])
+     assert "-an" in cmd and "-filter_complex" not in cmd
+-    assert cmd[cmd.index("-ss") + 1] == "0.400"
+     assert cmd[cmd.index("-t") + 1] == "8.000"
+-    assert cmd.index("-ss") < cmd.index("-i")  # input option, applies to the video
++    assert "image2pipe" in cmd and cmd[cmd.index("-i") + 1] == "-"
+ 
+ 
+ def test_ffmpeg_cmd_mixes_every_clip_with_its_delay(tmp_path):
+     tracks = [(tmp_path / "a.wav", 0.0), (tmp_path / "b.wav", 2.5)]
+-    cmd = render.build_ffmpeg_cmd(tmp_path / "in.webm", tmp_path / "out.mp4", 30, 8.0, 0.0, tracks)
++    cmd = render.build_ffmpeg_cmd(tmp_path / "out.mp4", 30, 8.0, tracks)
+     graph = cmd[cmd.index("-filter_complex") + 1]
+     assert "adelay=0|0" in graph and "adelay=2500|2500" in graph
+     assert "amix=inputs=2:normalize=0" in graph
+-    assert "-ss" not in cmd  # zero offset means no trimming
+ 
+ 
+ # ------------------------------------------------------------------ real ffmpeg
+@@ -162,25 +160,40 @@ def _ffprobe(path, entries):
+ 
+ 
+ @pytest.fixture
+-def source_video(tmp_path):
++def frames(tmp_path):
++    """60 PNG frames (2 s at 30 fps), produced by ffmpeg itself."""
+     if not _ffmpeg_can_encode(tmp_path):
+         pytest.skip("ffmpeg with libx264 and ffprobe is required")
+-    src = tmp_path / "recording.mp4"
++    out = tmp_path / "frames"
++    out.mkdir()
+     subprocess.run(
+-        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=4:size=320x240:rate=25",
+-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
++        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30",
++         str(out / "f%03d.png")],
+         capture_output=True, check=True,
+     )
+-    return src
++    return [p.read_bytes() for p in sorted(out.glob("f*.png"))]
+ 
+ 
+-def test_encode_trims_to_storyboard_length_and_mixes_audio(tmp_path, source_video):
++def _encode(dst, frames, fps, total, tracks):
++    enc = render.Encoder(dst, fps, total, tracks)
++    for png in frames:
++        enc.write(png)
++    enc.close()
++
++
++def test_encoder_produces_h264_with_exact_length_and_mixed_audio(tmp_path, frames):
+     a = make_wav(tmp_path / "a.wav", seconds=0.5)
+     b = make_wav(tmp_path / "b.wav", seconds=0.5, freq=660)
+     out = tmp_path / "final.mp4"
+-    render.encode(source_video, out, 30, 2.0, 0.5, [(a, 0.0), (b, 1.0)])
++    _encode(out, frames, 30, 2.0, [(a, 0.0), (b, 1.0)])
+ 
+     assert abs(float(_ffprobe(out, "format=duration")["duration"]) - 2.0) < 0.15
++    video_frames = subprocess.run(
++        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames",
++         "-of", "csv=p=0", str(out)],
++        capture_output=True, text=True, check=True,
++    ).stdout.strip()
++    assert video_frames == "60"
+     streams = subprocess.run(
+         ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,channels,sample_rate",
+          "-of", "json", str(out)],
+@@ -192,11 +205,10 @@ def test_encode_trims_to_storyboard_length_and_mixes_audio(tmp_path, source_vide
+     assert info["audio"]["channels"] == 2 and info["audio"]["sample_rate"] == "48000"
+ 
+ 
+-def test_encode_places_audio_at_the_requested_time(tmp_path, source_video):
+-    """The clip is delayed by 1s, so the first second of audio must be silent and later audio loud."""
++def test_encoder_places_audio_at_the_requested_time(tmp_path, frames):
+     clip = make_wav(tmp_path / "tone.wav", seconds=0.5)
+     out = tmp_path / "final.mp4"
+-    render.encode(source_video, out, 30, 2.0, 0.0, [(clip, 1.0)])
++    _encode(out, frames, 30, 2.0, [(clip, 1.0)])
+ 
+     def peak(start, dur):
+         res = subprocess.run(
+@@ -211,13 +223,13 @@ def test_encode_places_audio_at_the_requested_time(tmp_path, source_video):
+ 
+     before, during = peak(0.0, 0.8), peak(1.05, 0.4)
+     assert before != float("-inf") and during != float("-inf"), "volumedetect produced no reading"
+-    assert before < -60  # silence before the clip starts
+-    assert during > -20  # tone while it plays
++    assert before < -60
++    assert during > -20
+ 
+ 
+-def test_encode_without_tracks_has_no_audio_stream(tmp_path, source_video):
++def test_encoder_without_tracks_has_no_audio_stream(tmp_path, frames):
+     out = tmp_path / "silent.mp4"
+-    render.encode(source_video, out, 30, 2.0, 0.0, [])
++    _encode(out, frames, 30, 2.0, [])
+     codec_types = subprocess.run(
+         ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(out)],
+         capture_output=True, text=True, check=True,
+@@ -225,11 +237,126 @@ def test_encode_without_tracks_has_no_audio_stream(tmp_path, source_video):
+     assert codec_types == ["video"]
+ 
+ 
+-def test_encode_surfaces_ffmpeg_errors(tmp_path):
++def test_encoder_surfaces_ffmpeg_errors(tmp_path):
+     if not shutil.which("ffmpeg"):
+         pytest.skip("ffmpeg is required")
++    enc = render.Encoder(tmp_path / "no-such-dir" / "out.mp4", 30, 1.0, [])
+     with pytest.raises(RuntimeError):
+-        render.encode(tmp_path / "missing.webm", tmp_path / "out.mp4", 30, 1.0, 0.0, [])
++        for _ in range(50):
++            enc.write(b"not a png")
++        enc.close()
++
++
++# ------------------------------------------------------------------ import map / HTTP server
++
++def test_import_map_is_injected_once_into_head():
++    html = b"<html><head><title>x</title></head><body></body></html>"
++    out = render.inject_import_map(html).decode()
++    assert out.index("importmap") < out.index("<title>")
++    for name in ("three", "gsap", "katex", "mathkit"):
++        assert f'"{name}"' in out
++    assert render.inject_import_map(out.encode()).decode() == out  # idempotent
++    assert "importmap" in render.inject_import_map(b"<p>no head</p>").decode()
++
++
++@pytest.fixture
++def server(tmp_path):
++    import urllib.request  # noqa: F401
++
++    project = tmp_path / "proj"
++    (project / "source").mkdir(parents=True)
++    (project / "source" / "index.html").write_text("<html><head></head><body>hi</body></html>")
++    (project / "source" / "data.bin").write_bytes(bytes(range(100)))
++    (tmp_path / "secret.txt").write_text("secret")
++    lib = tmp_path / "lib"
++    lib.mkdir()
++    (lib / "x.js").write_text("export default 1")
++    srv = render.start_server(project, {"gsap": lib})
++    yield f"http://127.0.0.1:{srv.server_address[1]}"
++    srv.shutdown()
++
++
++def _get(url, headers=None):
++    import urllib.error
++    import urllib.request
++
++    try:
++        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {})) as r:
++            return r.status, r.read(), dict(r.headers)
++    except urllib.error.HTTPError as e:
++        return e.code, b"", {}
++
++
++def test_server_serves_project_vendor_and_injects_import_map(server):
++    status, body, _ = _get(server + "/source/index.html")
++    assert status == 200 and b"importmap" in body
++    assert _get(server + "/vendor/gsap/x.js")[1] == b"export default 1"
++
++
++def test_server_blocks_traversal_unknown_vendor_and_missing_files(server):
++    assert _get(server + "/source/../../secret.txt")[0] == 404
++    assert _get(server + "/%2e%2e/secret.txt")[0] == 404
++    assert _get(server + "/vendor/gsap/../../secret.txt")[0] == 404
++    assert _get(server + "/vendor/nope/x.js")[0] == 404
++    assert _get(server + "/source/missing.js")[0] == 404
++
++
++def test_server_favicon_is_204_and_ranges_work(server):
++    assert _get(server + "/favicon.ico")[0] == 204
++    status, body, _ = _get(server + "/source/data.bin", {"Range": "bytes=10-19"})
++    assert status == 206 and body == bytes(range(10, 20))
++
++
++# ------------------------------------------------------------------ real browser (optional)
++
++def _chromium():
++    try:
++        import playwright  # noqa: F401
++    except ImportError:
++        return None
++    import os
++
++    for cand in (os.environ.get("CHROMIUM_PATH"), shutil.which("chromium"), "/opt/pw-browsers/chromium"):
++        if cand and Path(cand).exists():
++            return cand
++    return None
++
++
++def test_virtual_clock_makes_rendering_deterministic(tmp_path, monkeypatch, capsys):
++    chromium = _chromium()
++    if not chromium or not shutil.which("ffmpeg"):
++        pytest.skip("Chromium + playwright + ffmpeg are required")
++    monkeypatch.setenv("CHROMIUM_PATH", chromium)
++    proj = tmp_path / "p"
++    (proj / "source").mkdir(parents=True)
++    (proj / "source" / "index.html").write_text(
++        "<html><body style='margin:0;background:#000'>"
++        "<div id=b style='width:50px;height:50px;background:#f00;position:absolute;"
++        "animation:m 1s linear forwards'></div>"
++        "<style>@keyframes m{from{left:0}to{left:200px}}</style>"
++        "<script>let n=0;setTimeout(()=>{document.body.style.background='#00f'},500)</script>"
++        "</body></html>"
++    )
++    (proj / "storyboard.json").write_text(
++        json.dumps({"scenes": [{"id": "s", "duration_seconds": 1}]})
++    )
++    def run():
++        render.render(proj, 320, 180, 10)
++        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
++
++    first = run()
++    assert first["frames"] == 10 and first["browser_messages"] == []
++    assert abs(float(_ffprobe(first["output"], "format=duration")["duration"]) - 1.0) < 0.15
++    ref = subprocess.run(
++        ["ffmpeg", "-v", "error", "-i", first["output"], "-f", "framemd5", "-"],
++        capture_output=True, text=True, check=True,
++    ).stdout
++    again = run()
++    ref2 = subprocess.run(
++        ["ffmpeg", "-v", "error", "-i", again["output"], "-f", "framemd5", "-"],
++        capture_output=True, text=True, check=True,
++    ).stdout
++    assert ref == ref2
+ 
+ 
+ # ------------------------------------------------------------------ tts
+-- 
+2.43.0
+
