@@ -1,0 +1,6 @@
+{
+  "scenes": [
+    { "id": "intro", "title": "Title and axes", "duration_seconds": 4 },
+    { "id": "build", "title": "Adding harmonics", "duration_seconds": 8 }
+  ]
+}

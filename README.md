@@ -271,3 +271,32 @@ Audio is sequential by construction:
 
 Rebuild the sandbox image after pulling (`docker build -t ai-video-sandbox sandbox`): it now installs
 `fonts-inter` and `fonts-roboto`.
+
+## Rendering engine, 3D, math and cartoon styles
+
+Videos are rendered **frame by frame**, not recorded in real time. The page runs against a
+virtual clock (`sandbox/renderer/runtime.js`): `performance.now`, `Date`, `requestAnimationFrame`,
+timers, CSS animations/transitions and Web Animations all advance exactly 1/fps per frame, so
+output is deterministic and never drops frames, however heavy the scene. Each frame is a PNG
+screenshot piped to ffmpeg (H.264, BT.709, narration mixed in).
+
+Optional page hooks: `window.__renderFrame(tMs, frameIndex)` (draw/seek yourself, may be async;
+do not return a GSAP timeline from it) and `window.__VIDEO_READY` (a Promise the renderer awaits
+before frame 0). Globals: `__VIDEO_FPS__`, `__VIDEO_TOTAL__`, `__VIDEO_WIDTH__`, `__VIDEO_HEIGHT__`,
+`__VIDEO_SCENES__`.
+
+Libraries available offline (served under `/vendor/<name>/`, import map injected automatically):
+`three`, `gsap`, `d3`, `katex`, and `mathkit` (a small manim-style toolkit for 3Blue1Brown-style
+math animation: `Scene`, `create`, `write`, `morph`, `shift`, `camera`, axes/plots, LaTeX via KaTeX).
+The agent picks the style from the request (3D, math, cartoon, or the default design kit); users
+never need to mention HTML/CSS.
+
+Try the examples: `python scripts/cli.py example math-3b1b` (also `three-3d`, `cartoon-explainer`),
+then `python scripts/cli.py render <project_id>`.
+
+Notes:
+- Frame-by-frame rendering is slower than real time (minutes per video; WebGL is software-rendered).
+  Use a lower fps/resolution for drafts. `SANDBOX_TIMEOUT_SECONDS` now defaults to 3600.
+- Rebuild the sandbox image once (`docker build -t ai-video-sandbox:latest sandbox`); the apt/pip
+  layers are cached, only the JS-library layer is new.
+- The design kit pages assume a 1920x1080 canvas.

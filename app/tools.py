@@ -221,4 +221,17 @@ def render(project_id: str, width: int, height: int, fps: int):
         raise RuntimeError("Render finished but renders/final/final.mp4 is missing.")
     result["video_url"] = f"/projects/{project_id}/video"
     result["size_bytes"] = video.stat().st_size
+    # render.py prints one JSON line (progress goes to stderr). Surface the useful parts,
+    # above all the page's own console errors (missing assets, JS errors, a timeline whose
+    # length differs from the storyboard), so the agent can fix them instead of guessing.
+    for line in reversed((result.get("stdout") or "").strip().splitlines()):
+        try:
+            info = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(info, dict) and info.get("ok"):
+            for key in ("frames", "fps", "render_seconds", "browser_messages"):
+                if key in info:
+                    result[key] = info[key]
+            break
     return result

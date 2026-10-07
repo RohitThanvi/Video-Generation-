@@ -1,0 +1,6 @@
+{
+  "scenes": [
+    { "id": "bounce", "title": "Squash and stretch", "duration_seconds": 5 },
+    { "id": "roll", "title": "Roll out", "duration_seconds": 3 }
+  ]
+}

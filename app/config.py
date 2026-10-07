@@ -28,7 +28,7 @@ SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "ai-video-sandbox:latest")
 SANDBOX_MEMORY = os.getenv("SANDBOX_MEMORY", "6g")
 SANDBOX_CPUS = os.getenv("SANDBOX_CPUS", "4")
 SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
-SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "900"))
+SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "3600"))
 
 DEFAULT_FPS = int(os.getenv("DEFAULT_FPS", "30"))
 DEFAULT_WIDTH = int(os.getenv("DEFAULT_WIDTH", "1920"))

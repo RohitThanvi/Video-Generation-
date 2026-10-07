@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Square wave from sine waves</title>
+</head>
+<body>
+<script type="module">
+  import { Scene, COLORS as C, create, write, fadeIn, swap, morph } from 'mathkit';
+
+  const scene = new Scene();
+
+  // Partial sums of the Fourier series of a square wave: (4/pi) * sum over odd k of sin(kx)/k
+  const partial = (n) => (x) => {
+    let s = 0;
+    for (let k = 1; k <= n; k += 2) s += Math.sin(k * x) / k;
+    return (4 / Math.PI) * s;
+  };
+
+  const title = scene.tex('\\text{Building a square wave from sine waves}', { at: [0, 3.6], size: 50 });
+  const axes = scene.axes({
+    xRange: [-Math.PI - 0.4, Math.PI + 0.4, Math.PI / 2],
+    yRange: [-1.6, 1.6, 1],
+    xLength: 12, yLength: 4.2, center: [0, -0.4], color: C.GREY,
+  });
+  const piLabel = scene.tex('\\pi', { at: [axes.c2p(Math.PI, 0)[0], axes.c2p(Math.PI, 0)[1] - 0.35], size: 34, color: C.GREY });
+  const minusPi = scene.tex('-\\pi', { at: [axes.c2p(-Math.PI, 0)[0], axes.c2p(-Math.PI, 0)[1] - 0.35], size: 34, color: C.GREY });
+
+  const wave = axes.plot(partial(1), { color: C.BLUE, width: 6 });
+
+  const labelAt = [0, 2.75];
+  const labels = [
+    scene.tex('\\tfrac{4}{\\pi}\\sin x', { at: labelAt, size: 50, color: C.BLUE }),
+    scene.tex('\\tfrac{4}{\\pi}\\left(\\sin x+\\tfrac{\\sin 3x}{3}\\right)', { at: labelAt, size: 46, color: C.TEAL }),
+    scene.tex('\\tfrac{4}{\\pi}\\left(\\sin x+\\tfrac{\\sin 3x}{3}+\\tfrac{\\sin 5x}{5}\\right)', { at: labelAt, size: 44, color: C.GREEN }),
+    scene.tex('\\tfrac{4}{\\pi}\\left(\\sin x+\\tfrac{\\sin 3x}{3}+\\cdots+\\tfrac{\\sin 9x}{9}\\right)', { at: labelAt, size: 42, color: C.YELLOW }),
+    scene.tex('\\tfrac{4}{\\pi}\\sum_{k\\ \\mathrm{odd}\\le 51}\\tfrac{\\sin kx}{k}', { at: labelAt, size: 46, color: C.ORANGE }),
+  ];
+
+  // intro (4 s)
+  scene.play(write(title, { duration: 1.6 }), create(axes, { duration: 1.6 }), fadeIn([piLabel, minusPi], { duration: 1 }));
+  scene.play(create(wave, { duration: 1.5 }), fadeIn(labels[0], { duration: 1, shift: [0, -0.2] }));
+  scene.wait(0.9);
+
+  // build (8 s)
+  const steps = [3, 5, 9, 51];
+  steps.forEach((n, i) => {
+    scene.play(morph(wave, partial(n), { duration: 1.5 }), swap(labels[i], labels[i + 1], { duration: 1.5 }));
+    scene.wait(0.4);
+  });
+  scene.padTo(window.__VIDEO_TOTAL__ ?? scene.cursor);
+  scene.start();
+</script>
+</body>
+</html>

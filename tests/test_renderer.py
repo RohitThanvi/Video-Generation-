@@ -124,20 +124,18 @@ def test_plan_audio_rejects_missing_referenced_clip(tmp_path):
 # ------------------------------------------------------------------ ffmpeg command
 
 def test_ffmpeg_cmd_without_audio_is_silent_and_trimmed(tmp_path):
-    cmd = render.build_ffmpeg_cmd(tmp_path / "in.webm", tmp_path / "out.mp4", 30, 8.0, 0.4, [])
+    cmd = render.build_ffmpeg_cmd(tmp_path / "out.mp4", 30, 8.0, [])
     assert "-an" in cmd and "-filter_complex" not in cmd
-    assert cmd[cmd.index("-ss") + 1] == "0.400"
     assert cmd[cmd.index("-t") + 1] == "8.000"
-    assert cmd.index("-ss") < cmd.index("-i")  # input option, applies to the video
+    assert "image2pipe" in cmd and cmd[cmd.index("-i") + 1] == "-"
 
 
 def test_ffmpeg_cmd_mixes_every_clip_with_its_delay(tmp_path):
     tracks = [(tmp_path / "a.wav", 0.0), (tmp_path / "b.wav", 2.5)]
-    cmd = render.build_ffmpeg_cmd(tmp_path / "in.webm", tmp_path / "out.mp4", 30, 8.0, 0.0, tracks)
+    cmd = render.build_ffmpeg_cmd(tmp_path / "out.mp4", 30, 8.0, tracks)
     graph = cmd[cmd.index("-filter_complex") + 1]
     assert "adelay=0|0" in graph and "adelay=2500|2500" in graph
     assert "amix=inputs=2:normalize=0" in graph
-    assert "-ss" not in cmd  # zero offset means no trimming
 
 
 # ------------------------------------------------------------------ real ffmpeg
@@ -162,25 +160,40 @@ def _ffprobe(path, entries):
 
 
 @pytest.fixture
-def source_video(tmp_path):
+def frames(tmp_path):
+    """60 PNG frames (2 s at 30 fps), produced by ffmpeg itself."""
     if not _ffmpeg_can_encode(tmp_path):
         pytest.skip("ffmpeg with libx264 and ffprobe is required")
-    src = tmp_path / "recording.mp4"
+    out = tmp_path / "frames"
+    out.mkdir()
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=4:size=320x240:rate=25",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=30",
+         str(out / "f%03d.png")],
         capture_output=True, check=True,
     )
-    return src
+    return [p.read_bytes() for p in sorted(out.glob("f*.png"))]
 
 
-def test_encode_trims_to_storyboard_length_and_mixes_audio(tmp_path, source_video):
+def _encode(dst, frames, fps, total, tracks):
+    enc = render.Encoder(dst, fps, total, tracks)
+    for png in frames:
+        enc.write(png)
+    enc.close()
+
+
+def test_encoder_produces_h264_with_exact_length_and_mixed_audio(tmp_path, frames):
     a = make_wav(tmp_path / "a.wav", seconds=0.5)
     b = make_wav(tmp_path / "b.wav", seconds=0.5, freq=660)
     out = tmp_path / "final.mp4"
-    render.encode(source_video, out, 30, 2.0, 0.5, [(a, 0.0), (b, 1.0)])
+    _encode(out, frames, 30, 2.0, [(a, 0.0), (b, 1.0)])
 
     assert abs(float(_ffprobe(out, "format=duration")["duration"]) - 2.0) < 0.15
+    video_frames = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames",
+         "-of", "csv=p=0", str(out)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert video_frames == "60"
     streams = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,channels,sample_rate",
          "-of", "json", str(out)],
@@ -192,11 +205,10 @@ def test_encode_trims_to_storyboard_length_and_mixes_audio(tmp_path, source_vide
     assert info["audio"]["channels"] == 2 and info["audio"]["sample_rate"] == "48000"
 
 
-def test_encode_places_audio_at_the_requested_time(tmp_path, source_video):
-    """The clip is delayed by 1s, so the first second of audio must be silent and later audio loud."""
+def test_encoder_places_audio_at_the_requested_time(tmp_path, frames):
     clip = make_wav(tmp_path / "tone.wav", seconds=0.5)
     out = tmp_path / "final.mp4"
-    render.encode(source_video, out, 30, 2.0, 0.0, [(clip, 1.0)])
+    _encode(out, frames, 30, 2.0, [(clip, 1.0)])
 
     def peak(start, dur):
         res = subprocess.run(
@@ -211,13 +223,13 @@ def test_encode_places_audio_at_the_requested_time(tmp_path, source_video):
 
     before, during = peak(0.0, 0.8), peak(1.05, 0.4)
     assert before != float("-inf") and during != float("-inf"), "volumedetect produced no reading"
-    assert before < -60  # silence before the clip starts
-    assert during > -20  # tone while it plays
+    assert before < -60
+    assert during > -20
 
 
-def test_encode_without_tracks_has_no_audio_stream(tmp_path, source_video):
+def test_encoder_without_tracks_has_no_audio_stream(tmp_path, frames):
     out = tmp_path / "silent.mp4"
-    render.encode(source_video, out, 30, 2.0, 0.0, [])
+    _encode(out, frames, 30, 2.0, [])
     codec_types = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(out)],
         capture_output=True, text=True, check=True,
@@ -225,11 +237,126 @@ def test_encode_without_tracks_has_no_audio_stream(tmp_path, source_video):
     assert codec_types == ["video"]
 
 
-def test_encode_surfaces_ffmpeg_errors(tmp_path):
+def test_encoder_surfaces_ffmpeg_errors(tmp_path):
     if not shutil.which("ffmpeg"):
         pytest.skip("ffmpeg is required")
+    enc = render.Encoder(tmp_path / "no-such-dir" / "out.mp4", 30, 1.0, [])
     with pytest.raises(RuntimeError):
-        render.encode(tmp_path / "missing.webm", tmp_path / "out.mp4", 30, 1.0, 0.0, [])
+        for _ in range(50):
+            enc.write(b"not a png")
+        enc.close()
+
+
+# ------------------------------------------------------------------ import map / HTTP server
+
+def test_import_map_is_injected_once_into_head():
+    html = b"<html><head><title>x</title></head><body></body></html>"
+    out = render.inject_import_map(html).decode()
+    assert out.index("importmap") < out.index("<title>")
+    for name in ("three", "gsap", "katex", "mathkit"):
+        assert f'"{name}"' in out
+    assert render.inject_import_map(out.encode()).decode() == out  # idempotent
+    assert "importmap" in render.inject_import_map(b"<p>no head</p>").decode()
+
+
+@pytest.fixture
+def server(tmp_path):
+    import urllib.request  # noqa: F401
+
+    project = tmp_path / "proj"
+    (project / "source").mkdir(parents=True)
+    (project / "source" / "index.html").write_text("<html><head></head><body>hi</body></html>")
+    (project / "source" / "data.bin").write_bytes(bytes(range(100)))
+    (tmp_path / "secret.txt").write_text("secret")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "x.js").write_text("export default 1")
+    srv = render.start_server(project, {"gsap": lib})
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
+def _get(url, headers=None):
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {})) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, b"", {}
+
+
+def test_server_serves_project_vendor_and_injects_import_map(server):
+    status, body, _ = _get(server + "/source/index.html")
+    assert status == 200 and b"importmap" in body
+    assert _get(server + "/vendor/gsap/x.js")[1] == b"export default 1"
+
+
+def test_server_blocks_traversal_unknown_vendor_and_missing_files(server):
+    assert _get(server + "/source/../../secret.txt")[0] == 404
+    assert _get(server + "/%2e%2e/secret.txt")[0] == 404
+    assert _get(server + "/vendor/gsap/../../secret.txt")[0] == 404
+    assert _get(server + "/vendor/nope/x.js")[0] == 404
+    assert _get(server + "/source/missing.js")[0] == 404
+
+
+def test_server_favicon_is_204_and_ranges_work(server):
+    assert _get(server + "/favicon.ico")[0] == 204
+    status, body, _ = _get(server + "/source/data.bin", {"Range": "bytes=10-19"})
+    assert status == 206 and body == bytes(range(10, 20))
+
+
+# ------------------------------------------------------------------ real browser (optional)
+
+def _chromium():
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return None
+    import os
+
+    for cand in (os.environ.get("CHROMIUM_PATH"), shutil.which("chromium"), "/opt/pw-browsers/chromium"):
+        if cand and Path(cand).exists():
+            return cand
+    return None
+
+
+def test_virtual_clock_makes_rendering_deterministic(tmp_path, monkeypatch, capsys):
+    chromium = _chromium()
+    if not chromium or not shutil.which("ffmpeg"):
+        pytest.skip("Chromium + playwright + ffmpeg are required")
+    monkeypatch.setenv("CHROMIUM_PATH", chromium)
+    proj = tmp_path / "p"
+    (proj / "source").mkdir(parents=True)
+    (proj / "source" / "index.html").write_text(
+        "<html><body style='margin:0;background:#000'>"
+        "<div id=b style='width:50px;height:50px;background:#f00;position:absolute;"
+        "animation:m 1s linear forwards'></div>"
+        "<style>@keyframes m{from{left:0}to{left:200px}}</style>"
+        "<script>let n=0;setTimeout(()=>{document.body.style.background='#00f'},500)</script>"
+        "</body></html>"
+    )
+    (proj / "storyboard.json").write_text(
+        json.dumps({"scenes": [{"id": "s", "duration_seconds": 1}]})
+    )
+    def run():
+        render.render(proj, 320, 180, 10)
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    first = run()
+    assert first["frames"] == 10 and first["browser_messages"] == []
+    assert abs(float(_ffprobe(first["output"], "format=duration")["duration"]) - 1.0) < 0.15
+    ref = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", first["output"], "-f", "framemd5", "-"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    again = run()
+    ref2 = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", again["output"], "-f", "framemd5", "-"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert ref == ref2
 
 
 # ------------------------------------------------------------------ tts
