@@ -1,31 +1,16 @@
-from openai import OpenAI, RateLimitError
+from openai import OpenAI
 import json
-import re
-import time
-from .config import GROQ_API_KEY, GROQ_MODEL
+from . import llm
+from .config import GROQ_API_KEY, GROQ_MODEL, LLM_TIMEOUT_SECONDS
 from .project import project_dir, load_project, list_files
 from .web_assets import search_free_images, download_asset
-from .tools import write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render, install_design_kit
+from .tools import read_source, patch_source, generate_narrations, write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render, install_design_kit
 
-MAX_RETRIES = 6
-
-def _retry_after_seconds(exc: RateLimitError) -> float | None:
-    """Groq tells us the exact wait in the error body ('Please try again in 5.895s')."""
-    m = re.search(r"try again in ([\d.]+)s", str(exc), re.IGNORECASE)
-    return float(m.group(1)) if m else None
-
-def _create_completion_with_retry(client, **kwargs):
-    """Groq's on-demand tier is TPM-limited; wait out the window and retry instead of dying."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            return client.chat.completions.create(**kwargs)
-        except RateLimitError as exc:
-            if attempt == MAX_RETRIES - 1:
-                raise
-            delay = _retry_after_seconds(exc)
-            if delay is None:
-                delay = min(2 ** attempt * 5, 60)  # 5s, 10s, 20s, ... capped at 60s
-            time.sleep(delay + 0.5)
+MAX_TOOL_OUTPUT_CHARS = 3000
+MAX_TURNS = 30
+# Tools whose arguments are big (whole files). Once saved, history keeps only a stub, so the
+# model is not charged for re-reading its own file on every later turn.
+_BULKY_ARGS = {"write_source": "content", "save_text_asset": "content", "write_storyboard": "storyboard"}
 
 SYSTEM = r"""
 You are the director/engineering agent for a deterministic HTML-to-video compiler. You build a
@@ -36,6 +21,10 @@ inside the project workspace using ONLY the provided tools.
 - Never invent filesystem locations; use the semantic tools. Source code goes in source/, narration text in narration/.
 - The renderer has no network: no CDNs, no remote images/fonts/scripts. Everything is local or inline. To use web material, call search_free_images (openly licensed, free) and download_asset first, then reference the saved local file (e.g. ../assets/images/x.jpg). Only download what the video needs; credit the creator in a final scene when the license requires attribution.
 - Canvas is 1920x1080. The page is rendered frame by frame on a virtual clock that starts at page load (performance.now, Date, requestAnimationFrame, timers, CSS animations, GSAP and three.js clocks all follow it, so nothing drops frames); video length = sum of storyboard durations.
+- Libraries ALREADY INSTALLED in the renderer (never ask the user to upload them, never write them into source/, never download them): three.js (`import * as THREE from 'three'`, addons via 'three/addons/...'), gsap, d3, katex, and mathkit. Use them directly; the page's import map is added automatically. Do not use CDNs or a local three.min.js.
+- Files you saved appear in the history as "[saved N chars]" to save tokens; that is only elision. Always send real, complete content when you write. To change a saved file use patch_source (small fixes) or read_source then patch; do not rewrite the whole file for a small fix.
+- Several narration clips: call generate_narrations once with all of them instead of generate_narration repeatedly.
+- Never stop to ask the user for a library or file, and never paste the code into your reply: always call write_source / write_storyboard / generate_narration / validate_project / render_video yourself and finish the video.
 - Audio inside the page is NOT recorded. Narration is made with generate_narration and attached to a scene in storyboard.json ("narration": "<file>.wav"); the compiler mixes it in.
 - The page is served over http inside the sandbox: relative fetch() of project files works, but prefer inlining small data.
 - Keep facts accurate and spell text exactly. Never claim success before render_video returns ok. Never run host commands. ingest_host_asset only for paths the user wrote.
@@ -189,6 +178,57 @@ def _tool_schemas():
         {
             "type": "function",
             "function": {
+                "name": "read_source",
+                "description": "Read a file under source/ (your history only keeps a stub of files you saved).",
+                "parameters": {"type": "object", "properties": {"relative_path": {"type": "string"}}, "required": ["relative_path"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "patch_source",
+                "description": "Replace exact text in a file under source/. Cheap way to fix a bug or tweak a value. `old` must match exactly once unless replace_all is true.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "relative_path": {"type": "string"},
+                        "old": {"type": "string"},
+                        "new": {"type": "string"},
+                        "replace_all": {"type": "boolean"}
+                    },
+                    "required": ["relative_path", "old", "new"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_narrations",
+                "description": "Generate several narration clips at once (parallel). Same fields as generate_narration per clip; returns narration_seconds and min_scene_duration_seconds for each.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "clips": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filename": {"type": "string"},
+                                    "text": {"type": "string"},
+                                    "rate": {"type": "integer"},
+                                    "volume": {"type": "number"}
+                                },
+                                "required": ["filename", "text"]
+                            }
+                        }
+                    },
+                    "required": ["clips"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "search_free_images",
                 "description": "Search openly licensed images on the web (Openverse, free). Returns direct image URLs with license and creator. Download one with download_asset, then reference it as a local file.",
                 "parameters": {
@@ -282,6 +322,12 @@ def _call_tool(project_id, name, args, supplied_text=""):
             args["source_path"],
             args.get("filename"),
         )
+    if name == "read_source":
+        return read_source(project_id, args["relative_path"])
+    if name == "patch_source":
+        return patch_source(project_id, args["relative_path"], args["old"], args["new"], bool(args.get("replace_all")))
+    if name == "generate_narrations":
+        return generate_narrations(project_id, args["clips"])
     if name == "search_free_images":
         return search_free_images(args["query"], int(args.get("limit") or 6))
     if name == "download_asset":
@@ -292,13 +338,42 @@ def _call_tool(project_id, name, args, supplied_text=""):
         return render(project_id, int(args["width"]), int(args["height"]), int(args["fps"]))
     raise ValueError(f"Unknown tool: {name}")
 
-def run_agent(project_id: str, instruction: str | None = None):
+def _summarize_call(name: str, args: dict) -> str:
+    """Short human-readable line for the live progress feed."""
+    for key in ("relative_path", "filename", "query", "url"):
+        if isinstance(args.get(key), str):
+            return f"{name} {args[key][:80]}"
+    if name == "generate_narrations":
+        return f"{name} ({len(args.get('clips') or [])} clips)"
+    if name == "render_video":
+        return f"{name} {args.get('width')}x{args.get('height')}@{args.get('fps')}"
+    return name
+
+def _compact_call(call: dict, args: dict, result_ok: bool) -> None:
+    """Replace a saved file's bulky argument with a stub, in place, in the history."""
+    key = _BULKY_ARGS.get(call["function"]["name"])
+    if not (key and result_ok and key in args):
+        return
+    value = args[key]
+    size = len(value) if isinstance(value, str) else len(json.dumps(value, default=str))
+    stub = dict(args)
+    stub[key] = f"[saved {size} chars]"
+    call["function"]["arguments"] = json.dumps(stub)
+
+def _clip(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    return text if len(text) <= limit else text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+def run_agent(project_id: str, instruction: str | None = None, on_event=None):
+    """Drive the model until the video is built. `on_event(str)` receives live progress lines."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured.")
+    emit = on_event or (lambda message: None)
 
     client = OpenAI(
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
+        timeout=LLM_TIMEOUT_SECONDS,
+        max_retries=0,  # llm.complete owns retry/backoff so the shared budget stays accurate
     )
 
     manifest = load_project(project_id)
@@ -316,13 +391,17 @@ def run_agent(project_id: str, instruction: str | None = None):
     ]
     # Text the user wrote themselves: the only place a host path may come from.
     supplied_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
+    usage = llm.Usage()
+    tools = _tool_schemas()
 
-    for _ in range(30):
-        response = _create_completion_with_retry(
+    for turn in range(1, MAX_TURNS + 1):
+        emit(f"Thinking (step {turn})…")
+        response = llm.complete(
             client,
+            usage=usage,
             model=GROQ_MODEL,
             messages=messages,
-            tools=_tool_schemas(),
+            tools=tools,
             tool_choice="auto",
             temperature=0.2,
         )
@@ -344,9 +423,10 @@ def run_agent(project_id: str, instruction: str | None = None):
         messages.append(assistant)
 
         if not msg.tool_calls:
-            return {"status": "completed", "message": msg.content or "Agent completed."}
+            return {"status": "completed", "message": msg.content or "Agent completed.", "usage": usage.as_dict()}
 
-        for tc in msg.tool_calls:
+        for tc, call in zip(msg.tool_calls, assistant["tool_calls"]):
+            args = {}
             try:
                 # Tools without parameters (validate_project) are often called with an
                 # empty string instead of "{}".
@@ -354,15 +434,18 @@ def run_agent(project_id: str, instruction: str | None = None):
                 args = json.loads(raw_args) if raw_args and raw_args.strip() else {}
                 if not isinstance(args, dict):
                     raise ValueError("Tool arguments must be a JSON object.")
+                emit(_summarize_call(tc.function.name, args))
                 result = _call_tool(project_id, tc.function.name, args, supplied_text)
                 tool_output = {"ok": True, "result": result}
             except Exception as exc:
                 tool_output = {"ok": False, "error": str(exc)}
+                emit(f"{tc.function.name} failed: {str(exc)[:160]}")
+            _compact_call(call, args, tool_output["ok"])
 
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": json.dumps(tool_output, default=str),
+                "content": _clip(json.dumps(tool_output, default=str)),
             })
 
     raise RuntimeError("Agent reached the maximum tool-call iterations.")

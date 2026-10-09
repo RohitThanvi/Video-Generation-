@@ -5,10 +5,11 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .models import ProjectCreate, AgentRequest, RenderRequest
-from .project import create_project, load_project, project_dir
+from .models import ProjectCreate, AgentRequest, RenderRequest, JobRequest
+from .project import create_project, load_project, project_dir, require_project_dir
 from .config import PROJECT_ROOT, MAX_FILE_BYTES
 from .agent import run_agent
+from . import jobs
 from .tools import validate, render, ingest_host_asset, ValidationFailed, CATEGORY_EXTENSIONS
 
 app = FastAPI(title="AI Video Compiler", version="0.2.0")
@@ -63,6 +64,37 @@ def agent(project_id: str, req: AgentRequest | None = None):
         return run_agent(project_id, req.instruction if req else None)
     except Exception as exc:
         raise _http_error(exc)
+
+@app.post("/projects/{project_id}/jobs", status_code=202)
+def start_job(project_id: str, req: JobRequest):
+    """Start a long-running agent/render job in the background; poll GET /jobs/{id}."""
+    try:
+        require_project_dir(project_id)
+        if req.kind == "agent":
+            fn = lambda emit: run_agent(project_id, req.instruction, on_event=emit)
+        else:
+            def fn(emit):
+                emit(f"Rendering {req.width}x{req.height} at {req.fps} fps (frame by frame, this takes a while)…")
+                return render(project_id, req.width, req.height, req.fps)
+        job = jobs.manager.submit(project_id, req.kind, fn)
+    except jobs.JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise _http_error(exc)
+    return job.snapshot()
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str, since: int = 0):
+    job = jobs.manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job.snapshot(max(0, since))
+
+@app.get("/projects/{project_id}/job")
+def active_job(project_id: str):
+    """The project's running job, if any (lets the UI re-attach after a page reload)."""
+    job = jobs.manager.active_for_project(project_id)
+    return job.snapshot() if job else {"status": "idle"}
 
 @app.post("/projects/{project_id}/validate")
 def validate_endpoint(project_id: str):

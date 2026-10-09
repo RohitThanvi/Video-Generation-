@@ -24,6 +24,18 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
+# LLM budget (shared by every agent run in this process). 0 = no client-side limit; the
+# server's 429 + Retry-After is still honoured. Set LLM_TPM to your plan's tokens-per-minute.
+LLM_TPM = int(os.getenv("LLM_TPM", "0"))
+LLM_RPM = int(os.getenv("LLM_RPM", "0"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "").strip()
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+
+# Background jobs: how many agent/render jobs run at once, and how many renders (CPU-heavy).
+JOB_WORKERS = int(os.getenv("JOB_WORKERS", "3"))
+RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", "1"))
+
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "ai-video-sandbox:latest")
 SANDBOX_MEMORY = os.getenv("SANDBOX_MEMORY", "6g")
 SANDBOX_CPUS = os.getenv("SANDBOX_CPUS", "4")

@@ -351,7 +351,8 @@ def test_agent_survives_empty_arguments_for_parameterless_tools(project, monkeyp
         [_response(tool_calls=[_tool_call("c1", "validate_project", "")]), _response("all good")],
     )
     result = agent.run_agent(project, "check it")
-    assert result == {"status": "completed", "message": "all good"}
+    assert result["status"] == "completed" and result["message"] == "all good"
+    assert result["usage"]["llm_calls"] == 2
     out = _last_tool_output(seen[1])
     assert out["ok"] is True and "valid" in out["result"]
 
@@ -410,7 +411,7 @@ def test_agent_tool_names_match_dispatcher():
     assert schema_names == {
         "write_storyboard", "write_source", "save_text_asset", "generate_narration",
         "ingest_host_asset", "validate_project", "render_video", "install_design_kit",
-        "search_free_images", "download_asset",
+        "search_free_images", "download_asset", "read_source", "patch_source", "generate_narrations",
     }
 
 
@@ -480,3 +481,11 @@ def test_system_prompt_enforces_the_design_and_sync_rules():
     text = agent.SYSTEM
     for needle in ["install_design_kit", "fade-in-up", "cubic-bezier", "data-scene", "min_scene_duration_seconds", "glass", "inline <svg"]:
         assert needle in text, needle
+
+
+def test_agent_prompt_says_bundled_libraries_need_no_upload():
+    from app import agent
+
+    prompt = agent.SYSTEM
+    assert "import * as THREE from 'three'" in prompt
+    assert "never ask the user to upload" in prompt

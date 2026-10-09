@@ -308,3 +308,20 @@ fetch public files with `download_asset`. Downloads run on the API host, are sav
 project's `assets/` folders, and the render sandbox stays offline (it only sees local files).
 Guards: http(s) only, public IPs only (redirects re-checked), size limit `MAX_FILE_BYTES`, file
 type must match the asset category. Disable with `ALLOW_WEB_ASSETS=false`.
+
+## Handling the LLM bottleneck
+
+- **Background jobs.** `POST /projects/{id}/jobs` (`{"kind":"agent","instruction":...}` or
+  `{"kind":"render","width":..,"height":..,"fps":..}`) returns `202` and a job id immediately;
+  `GET /jobs/{id}?since=N` returns live progress events, and `GET /projects/{id}/job` re-attaches
+  after a page reload. One active job per project (`409` otherwise). The UI uses this, so no
+  HTTP request stays open for minutes. The old synchronous endpoints still work.
+- **One shared LLM budget** (`app/llm.py`): set `LLM_TPM` / `LLM_RPM` to your plan's limits and calls
+  wait *before* being sent instead of failing with 429. 429s honour the server's "try again in…"
+  hint, transient errors back off, and `GROQ_FALLBACK_MODEL` is used if the main model keeps failing.
+  `LLM_CONCURRENCY` caps simultaneous calls; `JOB_WORKERS` caps simultaneous jobs; renders queue behind
+  `RENDER_CONCURRENCY`.
+- **Fewer tokens per run.** Files the agent saved are replaced by a `[saved N chars]` stub in later
+  turns (they used to be re-sent on every call); `patch_source` / `read_source` let it fix a bug
+  without rewriting a whole page; `generate_narrations` makes all clips in one call, in parallel.
+- Each agent result includes `usage` (calls, prompt/completion tokens, retries, seconds waited).

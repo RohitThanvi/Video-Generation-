@@ -2,7 +2,9 @@ from pathlib import Path
 import json
 import mimetypes
 import shutil
-from .config import MAX_FILE_BYTES
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from .config import MAX_FILE_BYTES, RENDER_CONCURRENCY
 from .project import require_project_dir, load_project, save_project
 from .validation import validate_project, wav_seconds, min_scene_seconds
 from .docker_runner import run_in_sandbox
@@ -33,6 +35,11 @@ NARRATION_TEXT_EXTENSIONS = {".txt"}
 KIT_DIR = Path(__file__).resolve().parent / "kit"
 KIT_FILES = ("kit.css", "kit.js")
 
+# generate_narrations runs clips in parallel; manifest read-modify-write must not interleave.
+_MANIFEST_LOCK = threading.Lock()
+# Rendering is CPU/RAM heavy: more than RENDER_CONCURRENCY at once only makes everything slower.
+_RENDER_SLOTS = threading.BoundedSemaphore(max(1, RENDER_CONCURRENCY))
+
 class ValidationFailed(ValueError):
     """Raised by render() when the project does not pass validation."""
 
@@ -46,10 +53,10 @@ def _safe_name(name: str) -> str:
         raise ValueError("Invalid filename.")
     return name
 
-def write_source(project_id: str, relative_path: str, content: str):
+def _source_target(project_id: str, relative_path: str):
     root = require_project_dir(project_id)
     p = Path(relative_path)
-    # p.drive/p.root also catch Windows forms like "C:evil.js" or "\evil.js" that
+    # p.drive/p.root also catch Windows forms like "C:evil.js" or "\\evil.js" that
     # is_absolute() reports as relative but that replace the base when joined.
     if p.is_absolute() or p.drive or p.root or ".." in p.parts:
         raise ValueError("Path traversal is not allowed.")
@@ -59,9 +66,43 @@ def write_source(project_id: str, relative_path: str, content: str):
     target = (source_root / p).resolve()
     if not target.is_relative_to(source_root):
         raise ValueError("Path traversal is not allowed.")
+    return root, target
+
+def write_source(project_id: str, relative_path: str, content: str):
+    root, target = _source_target(project_id, relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return {"path": target.relative_to(root.resolve()).as_posix()}
+    return {"path": target.relative_to(root.resolve()).as_posix(), "chars": len(content)}
+
+READ_SOURCE_LIMIT = 24000
+
+def read_source(project_id: str, relative_path: str):
+    """Return a source file (the agent's history only keeps a stub of what it wrote)."""
+    root, target = _source_target(project_id, relative_path)
+    if not target.is_file():
+        raise FileNotFoundError(f"{relative_path} does not exist.")
+    text = target.read_text(encoding="utf-8")
+    return {
+        "path": target.relative_to(root.resolve()).as_posix(),
+        "content": text[:READ_SOURCE_LIMIT],
+        "truncated": len(text) > READ_SOURCE_LIMIT,
+    }
+
+def patch_source(project_id: str, relative_path: str, old: str, new: str, replace_all: bool = False):
+    """Replace exact text in a source file: a small fix costs a few tokens, not a full rewrite."""
+    root, target = _source_target(project_id, relative_path)
+    if not target.is_file():
+        raise FileNotFoundError(f"{relative_path} does not exist.")
+    if not old:
+        raise ValueError("old must not be empty.")
+    text = target.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count == 0:
+        raise ValueError("old text not found (it must match exactly, including whitespace).")
+    if count > 1 and not replace_all:
+        raise ValueError(f"old text matches {count} places; add more context or set replace_all.")
+    target.write_text(text.replace(old, new) if replace_all else text.replace(old, new, 1), encoding="utf-8")
+    return {"path": target.relative_to(root.resolve()).as_posix(), "replacements": count if replace_all else 1}
 
 def install_design_kit(project_id: str):
     """Copy the design system (kit.css) and scene engine (kit.js) into source/."""
@@ -164,17 +205,18 @@ def generate_narration(project_id: str, filename: str, text: str, rate: int = 17
     )
     if not audio_path.exists() or audio_path.stat().st_size == 0:
         raise RuntimeError("TTS command returned but the narration file is missing or empty.")
-    manifest = load_project(project_id)
     entry = {
         "filename": filename,
         "text_file": text_path.relative_to(root).as_posix(),
         "audio_path": f"narration/{filename}",
     }
-    # Regenerating a clip replaces its entry instead of adding a duplicate.
-    manifest["narration"] = [
-        n for n in manifest.get("narration", []) if n.get("filename") != filename
-    ] + [entry]
-    save_project(manifest)
+    with _MANIFEST_LOCK:
+        manifest = load_project(project_id)
+        # Regenerating a clip replaces its entry instead of adding a duplicate.
+        manifest["narration"] = [
+            n for n in manifest.get("narration", []) if n.get("filename") != filename
+        ] + [entry]
+        save_project(manifest)
     seconds = wav_seconds(audio_path)
     info = {
         "path": f"narration/{filename}",
@@ -187,6 +229,31 @@ def generate_narration(project_id: str, filename: str, text: str, rate: int = 17
         info["narration_seconds"] = round(seconds, 2)
         info["min_scene_duration_seconds"] = min_scene_seconds(seconds)
     return info
+
+def generate_narrations(project_id: str, clips: list):
+    """Generate several narration clips in one tool call, in parallel (one LLM turn, not N)."""
+    if not isinstance(clips, list) or not clips:
+        raise ValueError("clips must be a non-empty list of {filename, text}.")
+    if len(clips) > 20:
+        raise ValueError("At most 20 clips per call.")
+
+    def one(clip):
+        try:
+            if not isinstance(clip, dict):
+                raise ValueError("each clip must be an object with filename and text")
+            rate, volume = clip.get("rate"), clip.get("volume")
+            info = generate_narration(
+                project_id, clip["filename"], clip["text"],
+                170 if rate is None else int(rate), 1.0 if volume is None else float(volume),
+            )
+            info.pop("stdout", None)
+            return {"filename": clip["filename"], "ok": True, **info}
+        except Exception as exc:
+            name = clip.get("filename") if isinstance(clip, dict) else None
+            return {"filename": name, "ok": False, "error": str(exc)}
+
+    with ThreadPoolExecutor(max_workers=min(4, len(clips))) as pool:
+        return {"clips": list(pool.map(one, clips))}
 
 def validate(project_id: str):
     return validate_project(project_id)
@@ -205,17 +272,18 @@ def render(project_id: str, width: int, height: int, fps: int):
     if not validation["valid"]:
         raise ValidationFailed(validation["errors"])
     root = require_project_dir(project_id)
-    result = run_in_sandbox(
-        project_id,
-        [
-            "python", "/opt/renderer/render.py",
-            "--project", "/workspace",
-            "--width", str(width),
-            "--height", str(height),
-            "--fps", str(fps),
-        ],
-        output_name="renders/final/final.mp4",
-    )
+    with _RENDER_SLOTS:  # queue here when other renders are already using the CPU
+        result = run_in_sandbox(
+            project_id,
+            [
+                "python", "/opt/renderer/render.py",
+                "--project", "/workspace",
+                "--width", str(width),
+                "--height", str(height),
+                "--fps", str(fps),
+            ],
+            output_name="renders/final/final.mp4",
+        )
     video = root / "renders" / "final" / "final.mp4"
     if not video.is_file():
         raise RuntimeError("Render finished but renders/final/final.mp4 is missing.")
