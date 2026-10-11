@@ -19,6 +19,9 @@ PROJECT_ROOT = _project_root.resolve()
 HOST_PROJECT_ROOT = os.getenv("HOST_PROJECT_ROOT", "").strip()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# More keys, comma or newline separated. Requests are spread over all keys and a rate-limited key is
+# skipped until it recovers. Groq meters per organization, so use keys from different accounts.
+GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEYS", "").replace("\n", ",").split(",") if k.strip()]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
