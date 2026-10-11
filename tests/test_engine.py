@@ -162,3 +162,41 @@ def test_models_have_separate_rate_lanes(monkeypatch):
     a, _ = llm._lane("core", "core")
     b, _ = llm._lane("tiny", "tiny")
     assert a is llm._limiter and b is not a and llm._lane("tiny", "tiny")[0] is b
+
+
+def test_patch_scene_accepts_fields_id_without_scene_id(project, monkeypatch):
+    from app import agent
+    monkeypatch.setattr(tools, "generate_narrations", lambda pid, clips: {"clips": []})
+    engine.build_video(project, {"scenes": [{"id": "a", "headline": "One"}]}, narrate=False)
+    monkeypatch.setattr(engine, "build_video", lambda pid, spec, **kw: {"ids": [s["id"] for s in spec["scenes"]]})
+    out = agent._call_tool(project, "patch_scene", {"fields": {"id": "m", "layout": "stat", "headline": "100+", "stat": {"value": 100}}, "insert_after": "a"})
+    assert out["ids"] == ["a", "m"]
+    with pytest.raises(ValueError):
+        agent._call_tool(project, "patch_scene", {"fields": {"headline": "x"}})
+
+
+def test_invalid_tool_call_from_provider_is_fed_back_not_fatal(project, monkeypatch):
+    import httpx
+    from openai import APIStatusError
+    from app import agent
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://x"))
+    err = APIStatusError("Tool call validation failed (tool_use_failed): missing 'scene_id'", response=resp, body=None)
+    seen = []
+
+    class Client:
+        def __init__(self, **kw):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+        queue = [err, SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="all good", tool_calls=None))], usage=None)]
+
+        def create(self, **kw):
+            seen.append(kw["messages"][-1])
+            o = self.queue.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            return o
+    monkeypatch.setattr(agent, "OpenAI", Client)
+    monkeypatch.setattr(agent, "GROQ_API_KEY", "k")
+    events = []
+    out = agent.run_agent(project, "make a video about cats", on_event=events.append)
+    assert out["message"] == "all good"
+    assert "rejected" in seen[1]["content"] and any("invalid tool call" in e for e in events)

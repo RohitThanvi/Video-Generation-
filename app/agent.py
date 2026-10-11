@@ -1,4 +1,4 @@
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 import json
 import re
 import time
@@ -181,7 +181,7 @@ def _all_tool_schemas():
                         "scene_id": {"type": "string"}, "fields": {"type": "object"}, "insert_after": {"type": "string"},
                         "remove": {"type": "boolean"}, "video": {"type": "object"},
                     },
-                    "required": ["scene_id"],
+                    "required": [],  # scene_id may be omitted when fields.id is given (models often do)
                 },
             },
         },
@@ -395,7 +395,10 @@ def _call_tool(project_id, name, args, supplied_text="", emit=None, writer_for=N
         return engine.build_video(project_id, args["spec"], write_narration=(writer_for(emit) if writer_for else None), emit=emit)
     if name == "patch_scene":
         from . import engine
-        return engine.patch_scene(project_id, args["scene_id"], args.get("fields"), args.get("insert_after"),
+        scene_id = args.get("scene_id") or (args.get("fields") or {}).get("id")
+        if not scene_id:
+            raise ValueError("patch_scene needs scene_id (or fields.id).")
+        return engine.patch_scene(project_id, scene_id, args.get("fields"), args.get("insert_after"),
                                   bool(args.get("remove")), args.get("video"),
                                   write_narration=(writer_for(emit) if writer_for else None), emit=emit)
     if name == "install_design_kit":
@@ -460,7 +463,7 @@ def _summarize_call(name: str, args: dict) -> str:
         n = len(spec.get("scenes") or []) if isinstance(spec, dict) else "?"
         return f"build_video ({n} scenes)"
     if name == "patch_scene":
-        return f"patch_scene {str(args.get('scene_id'))[:40]}"
+        return f"patch_scene {str(args.get('scene_id') or (args.get('fields') or {}).get('id'))[:40]}"
     if name == "render_video":
         return f"{name} {args.get('width')}x{args.get('height')}@{args.get('fps')}"
     return name
@@ -579,6 +582,7 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     shrink_level = 0
     started = time.monotonic()
     recent: list[str] = []          # last tool calls, for diagnostics
+    bad_calls = 0
     seen_calls: dict[str, int] = {}  # identical (tool, args) repeats
     modified = rendered = False
     for turn in range(1, MAX_TURNS + 1):
@@ -613,6 +617,18 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                     temperature=0.2,
                 )
                 break
+            except APIStatusError as exc:
+                # Groq validates tool calls server-side and answers 400 tool_use_failed when the model's
+                # arguments break the schema. That is the model's mistake, not a dead end: tell it and go on.
+                if getattr(exc, "status_code", None) != 400 or "tool_use_failed" not in str(exc) or bad_calls >= 4:
+                    raise
+                bad_calls += 1
+                detail = re.sub(r"\s+", " ", str(getattr(exc, "message", exc)))[:300]
+                emit(f"The model sent an invalid tool call; asking it to retry ({bad_calls}/4).")
+                messages.append({"role": "user", "content": (
+                    "Your last tool call was rejected before it ran: " + detail +
+                    " Call the tool again with arguments that match its schema.")})
+                continue
             except llm.RequestTooLarge as exc:
                 if shrink_level >= 3 and slim:
                     raise RuntimeError(
