@@ -4,7 +4,7 @@ import mimetypes
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from .config import MAX_FILE_BYTES, RENDER_CONCURRENCY
+from .config import MAX_FILE_BYTES, RENDER_CONCURRENCY, RENDER_BUDGET_SECONDS
 from .project import require_project_dir, load_project, save_project
 from .validation import validate_project, wav_seconds, min_scene_seconds
 from .docker_runner import run_in_sandbox
@@ -266,7 +266,7 @@ def check_render_params(width: int, height: int, fps: int):
     if not 1 <= fps <= 120:
         raise ValueError("fps must be between 1 and 120.")
 
-def render(project_id: str, width: int, height: int, fps: int):
+def render(project_id: str, width: int, height: int, fps: int, on_progress=None):
     check_render_params(width, height, fps)
     validation = validate_project(project_id, require_renderable=True)
     if not validation["valid"]:
@@ -281,8 +281,11 @@ def render(project_id: str, width: int, height: int, fps: int):
                 "--width", str(width),
                 "--height", str(height),
                 "--fps", str(fps),
+                "--budget", str(RENDER_BUDGET_SECONDS),
             ],
             output_name="renders/final/final.mp4",
+            **({"on_line": lambda line: on_progress(line.split("progress:", 1)[1].strip())
+                if on_progress and line.startswith("progress:") else None} if on_progress else {}),
         )
     video = root / "renders" / "final" / "final.mp4"
     if not video.is_file():
@@ -298,7 +301,7 @@ def render(project_id: str, width: int, height: int, fps: int):
         except ValueError:
             continue
         if isinstance(info, dict) and info.get("ok"):
-            for key in ("frames", "fps", "render_seconds", "browser_messages"):
+            for key in ("frames", "fps", "render_seconds", "browser_messages", "adjusted"):
                 if key in info:
                     result[key] = info[key]
             break

@@ -1,5 +1,7 @@
 from pathlib import Path
 import subprocess
+import threading
+import time
 import uuid
 from .config import (
     SANDBOX_IMAGE,
@@ -38,7 +40,38 @@ def _hint(stderr: str) -> str:
         return f"\nHint: build the sandbox image first: docker build -t {SANDBOX_IMAGE} ./sandbox"
     return ""
 
-def run_in_sandbox(project_id: str, command: list[str], output_name: str | None = None):
+def _run_streaming(docker_cmd, on_line):
+    """Like subprocess.run, but forwards each stderr line to on_line while the container runs."""
+    proc = subprocess.Popen(docker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out_parts, err_parts = [], []
+
+    def pump(stream, parts, forward):
+        for line in stream:
+            parts.append(line)
+            if forward:
+                try:
+                    on_line(line.rstrip("\n"))
+                except Exception:
+                    pass  # a broken progress callback must never kill the render
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, out_parts, False), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, err_parts, True), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + SANDBOX_TIMEOUT_SECONDS
+    while proc.poll() is None:
+        if time.monotonic() > deadline:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(docker_cmd, SANDBOX_TIMEOUT_SECONDS)
+        time.sleep(0.2)
+    for t in threads:
+        t.join(timeout=5)
+    return subprocess.CompletedProcess(docker_cmd, proc.returncode, "".join(out_parts), "".join(err_parts))
+
+def run_in_sandbox(project_id: str, command: list[str], output_name: str | None = None, on_line=None):
     root = project_dir(project_id)
     if not root.exists():
         raise FileNotFoundError(project_id)
@@ -67,13 +100,16 @@ def run_in_sandbox(project_id: str, command: list[str], output_name: str | None 
     ]
 
     try:
-        completed = subprocess.run(
-            docker_cmd,
-            capture_output=True,
-            text=True,
-            timeout=SANDBOX_TIMEOUT_SECONDS,
-            check=False,
-        )
+        if on_line is None:
+            completed = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=SANDBOX_TIMEOUT_SECONDS,
+                check=False,
+            )
+        else:
+            completed = _run_streaming(docker_cmd, on_line)
     except subprocess.TimeoutExpired as exc:
         # subprocess only kills the `docker run` client; the container would keep running
         # (and eating CPU/RAM) without this.

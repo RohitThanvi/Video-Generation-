@@ -41,6 +41,10 @@ SANDBOX_MEMORY = os.getenv("SANDBOX_MEMORY", "6g")
 SANDBOX_CPUS = os.getenv("SANDBOX_CPUS", "4")
 SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
 SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "3600"))
+# Target maximum render time. The renderer first measures how fast this machine renders the
+# project, and lowers fps / resolution (output is scaled back up) until the projection fits.
+# 0 disables the adjustment (always full quality, however long it takes).
+RENDER_BUDGET_SECONDS = int(os.getenv("RENDER_BUDGET_SECONDS", "1500"))
 
 # Lets the agent search free (openly licensed) images and download assets on the API host.
 # The render sandbox itself always stays offline.

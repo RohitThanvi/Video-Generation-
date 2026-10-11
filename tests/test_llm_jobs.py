@@ -280,7 +280,174 @@ def test_job_endpoint_validation(client, project):
 def test_render_job_goes_through_render(client, project, monkeypatch):
     from app import main
 
-    monkeypatch.setattr(main, "render", lambda pid, w, h, f: {"size_bytes": 1, "w": w, "fps": f})
+    monkeypatch.setattr(main, "render", lambda pid, w, h, f, **kw: {"size_bytes": 1, "w": w, "fps": f})
     jid = client.post(f"/projects/{project}/jobs", json={"kind": "render", "width": 640, "height": 360, "fps": 12}).json()["id"]
     snap = _wait(client, jid)
     assert snap["status"] == "done" and snap["result"] == {"size_bytes": 1, "w": 640, "fps": 12}
+
+
+# ------------------------------------------------------------------ 413 / request too large
+
+def _too_large(limit=8000, requested=9500):
+    from openai import APIStatusError
+
+    req = httpx.Request("POST", "https://api.groq.com/x")
+    return APIStatusError(
+        f"Request too large for model on tokens per minute (TPM): Limit {limit}, Requested {requested}",
+        response=httpx.Response(413, request=req), body=None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def reset_learned_limit(monkeypatch):
+    monkeypatch.setattr(llm, "learned_limit", None)
+
+
+def test_413_becomes_request_too_large_and_is_remembered():
+    with pytest.raises(llm.RequestTooLarge) as info:
+        llm.complete(_client([_too_large()], []), sleep=lambda s: None, model="m", messages=[])
+    assert info.value.limit == 8000 and info.value.requested == 9500
+    assert llm.learned_limit == 8000
+
+
+def test_413_tries_the_fallback_model(monkeypatch):
+    monkeypatch.setattr(llm.config, "GROQ_FALLBACK_MODEL", "big-context")
+    models = []
+    llm.complete(_client([_too_large(), _ok()], models), sleep=lambda s: None, model="small", messages=[])
+    assert models == ["small", "big-context"]
+
+
+def test_agent_shrinks_context_and_retries_after_413(project, monkeypatch):
+    seen, remaining = [], [
+        _too_large(),
+        _resp("done after shrinking"),
+    ]
+
+    class Client:
+        def __init__(self, **kw):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kw):
+            seen.append(kw["messages"][0]["content"])
+            o = remaining.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            return o
+
+    monkeypatch.setattr(agent, "OpenAI", Client)
+    monkeypatch.setattr(agent, "GROQ_API_KEY", "k")
+    events = []
+    out = agent.run_agent(project, "make a video about cats", on_event=events.append)
+    assert out["message"] == "done after shrinking"
+    assert len(seen[1]) < len(seen[0])  # the retry used the slim system prompt
+    assert any("too large" in e for e in events)
+
+
+def test_agent_gives_actionable_error_when_even_the_smallest_request_is_rejected(project, monkeypatch):
+    class Client:
+        def __init__(self, **kw):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kw):
+            raise _too_large(2000, 9000)
+
+    monkeypatch.setattr(agent, "OpenAI", Client)
+    monkeypatch.setattr(agent, "GROQ_API_KEY", "k")
+    with pytest.raises(RuntimeError, match="GROQ_MODEL|larger limit"):
+        agent.run_agent(project, "x")
+
+
+def test_long_style_sections_only_when_requested():
+    base = agent.build_system("a video about cats")
+    assert "__renderFrame" not in base and "Scene()" not in base
+    assert "__renderFrame" in agent.build_system("a 3D solar system")
+    assert len(agent.build_system("cats", slim=True)) < len(base)
+
+
+def test_shrink_history_keeps_every_message_and_pairing():
+    msgs = [{"role": "system", "content": "s"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]}]
+    for i in range(10):
+        msgs.append({"role": "tool", "tool_call_id": str(i), "content": json.dumps({"ok": True, "result": "x" * 5000})})
+    n = len(msgs)
+    agent._shrink_history(msgs, 2)
+    assert len(msgs) == n
+    assert "[omitted]" in msgs[2]["content"] and len(msgs[-1]["content"]) < 700
+
+
+# ------------------------------------------------------------------ render time budget
+
+def _render_module():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "sandbox" / "renderer" / "render.py"
+    spec = importlib.util.spec_from_file_location("render_budget", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_choose_settings_keeps_full_quality_when_it_fits():
+    r = _render_module()
+    scale, fps, projected, adjusted = r.choose_settings(30, 20, 3600, lambda sc: 0.5)
+    assert (scale, fps, adjusted) == (1.0, 30, False) and projected == pytest.approx(20 * 30 * 0.5 * 1.1)
+
+
+def test_choose_settings_lowers_fps_then_resolution_to_fit_the_budget():
+    r = _render_module()
+    # 2 s/frame at full size: 24 fps * 24 s = 576 frames -> far over a 1000 s budget
+    cost = {1.0: 2.0, 0.75: 1.2, 0.5: 0.6}
+    scale, fps, projected, adjusted = r.choose_settings(30, 24, 1000, lambda sc: cost[sc])
+    assert adjusted and projected <= 1000
+    assert (scale, fps) in [(1.0, 15), (0.75, 15), (0.5, 24), (0.75, 24)]
+    # an impossible budget falls back to the cheapest rung instead of failing
+    scale, fps, projected, adjusted = r.choose_settings(30, 24, 10, lambda sc: cost[sc])
+    assert (scale, fps) == (0.5, 12) and adjusted
+
+
+def test_choose_settings_never_raises_fps_above_the_request():
+    r = _render_module()
+    scale, fps, _, _ = r.choose_settings(12, 10, 1, lambda sc: 5.0)
+    assert fps <= 12
+
+
+def test_ffmpeg_scales_back_up_when_captured_smaller():
+    r = _render_module()
+    cmd = r.build_ffmpeg_cmd("out.mp4", 24, 5.0, [], size=(1920, 1080))
+    assert "scale=1920:1080:flags=lanczos" in cmd[cmd.index("-vf") + 1]
+    assert "lanczos" not in r.build_ffmpeg_cmd("out.mp4", 24, 5.0, [])[r.build_ffmpeg_cmd("out.mp4", 24, 5.0, []).index("-vf") + 1]
+
+
+def test_render_surfaces_progress_lines_and_adjustment(project, monkeypatch):
+    import json as _json
+    from tests.conftest import make_renderable  # type: ignore
+
+    make_renderable(project)
+    got = []
+
+    def fake(project_id, command, output_name=None, on_line=None):
+        assert "--budget" in command
+        on_line("progress: frame 5/60 (8%), about 1.0 min left")
+        on_line("some other stderr")
+        (project_dir(project_id) / "renders" / "final" / "final.mp4").write_bytes(b"x")
+        return {"stdout": _json.dumps({"ok": True, "frames": 60, "fps": 15, "adjusted": {"rendered": {"fps": 15}}}),
+                "stderr": "", "output": output_name}
+
+    monkeypatch.setattr(tools, "run_in_sandbox", fake)
+    out = tools.render(project, 1280, 720, 30, on_progress=got.append)
+    assert got == ["frame 5/60 (8%), about 1.0 min left"]
+    assert out["adjusted"]["rendered"]["fps"] == 15 and out["fps"] == 15
+
+
+def test_streaming_runner_forwards_lines_and_enforces_failure(monkeypatch):
+    from app import docker_runner
+    import subprocess as sp
+    import sys
+
+    cmd = [sys.executable, "-c", "import sys;print('progress: one',file=sys.stderr);print('out');sys.exit(3)"]
+    lines = []
+    done = docker_runner._run_streaming(cmd, lines.append)
+    assert lines == ["progress: one"] and done.returncode == 3 and done.stdout.strip() == "out"
+    monkeypatch.setattr(docker_runner, "SANDBOX_TIMEOUT_SECONDS", 1)
+    with pytest.raises(sp.TimeoutExpired):
+        docker_runner._run_streaming([sys.executable, "-c", "import time;time.sleep(30)"], lines.append)

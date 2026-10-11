@@ -16,7 +16,7 @@ import threading
 import time
 from collections import deque
 
-from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, InternalServerError, RateLimitError
 
 from . import config
 
@@ -89,6 +89,26 @@ class TokenLimiter:
             self._window.append([now - WINDOW_SECONDS + seconds, self.tpm or 1])
 
 
+class RequestTooLarge(RuntimeError):
+    """HTTP 413: this single request is bigger than the model/plan allows (retrying cannot help)."""
+
+    def __init__(self, message, limit=None, requested=None):
+        super().__init__(message)
+        self.limit, self.requested = limit, requested
+
+
+# Largest request (tokens) the provider has told us it accepts; learned from a 413 and shared by
+# every run in this process so later runs start small instead of failing again.
+learned_limit: int | None = None
+
+
+def _parse_too_large(exc) -> RequestTooLarge:
+    text = str(exc)
+    m = re.search(r"Limit (\d+)[^0-9]+Requested (\d+)", text)
+    limit, requested = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    return RequestTooLarge(text[:400], limit, requested)
+
+
 class Usage:
     """Token totals for one agent run (thread-safe enough: one run == one thread)."""
 
@@ -156,6 +176,16 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, **kwargs):
                 if attempt < MAX_RETRIES - 1:
                     sleep(delay)
                 continue
+            except APIStatusError as exc:
+                _limiter.settle(entry, 0)
+                if getattr(exc, "status_code", None) == 413:
+                    err = _parse_too_large(exc)
+                    global learned_limit
+                    if err.limit:
+                        learned_limit = err.limit if learned_limit is None else min(learned_limit, err.limit)
+                    last_exc = err
+                    break  # a retry cannot help; try the fallback model if there is one
+                raise
             u = getattr(response, "usage", None)
             total = getattr(u, "total_tokens", None) if u else None
             _limiter.settle(entry, total)

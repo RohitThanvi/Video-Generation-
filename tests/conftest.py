@@ -48,7 +48,7 @@ def fake_sandbox(monkeypatch):
         calls = []
         creates = []
 
-        def __call__(self, project_id, command, output_name=None):
+        def __call__(self, project_id, command, output_name=None, on_line=None):
             self.calls.append(command)
             root = project_dir(project_id)
             for rel in self.creates:

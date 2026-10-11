@@ -345,3 +345,16 @@ screen, because every live WebGL context or full-screen blend layer makes each f
 CPU-only rendering. Measured on a 2-core VM at 1920x1080: about 1.2 s per frame for the showreel (a 24 s
 video at 30 fps is roughly 15 minutes there; give the sandbox more CPUs and it scales down). Use `fps: 24`
 or `fps: 15` for drafts.
+
+## Render time budget and "request too large" (413) handling
+
+- **Render budget.** Before rendering, the sandbox measures how fast this machine renders the project and, if
+  full quality would exceed `RENDER_BUDGET_SECONDS` (default 1500 = 25 min), lowers fps and then resolution
+  (the output is scaled back up to the size you asked for) until the projection fits. The result reports what was
+  changed in `adjusted`. Set `RENDER_BUDGET_SECONDS=0` to always render at full quality, however long it takes.
+  The UI shows live `frame N/M, about X min left` while it renders.
+- **413 from Groq** means one request is bigger than your plan/model allows per request (small free-tier limits are
+  often around 8k tokens). The agent now reads the limit from the error, switches to a slimmer system prompt,
+  shrinks old tool output in the history, and retries; later runs start slim. If it still does not fit, the error
+  tells you to pick a model with a larger limit (`GROQ_MODEL`, or `GROQ_FALLBACK_MODEL`, which is also tried on 413).
+  The long 3D / math / cartoon instructions are only sent when your prompt asks for those styles.

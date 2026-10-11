@@ -1,5 +1,6 @@
 from openai import OpenAI
 import json
+import re
 from . import llm
 from .config import GROQ_API_KEY, GROQ_MODEL, LLM_TIMEOUT_SECONDS
 from .project import project_dir, load_project, list_files
@@ -92,6 +93,27 @@ ART DIRECTION. The goal is a cinematic motion-graphics video, never a slide deck
 
 Create a polished explainer with real content and real visuals, not placeholders.
 """
+
+_FX_MARK = "\n## Motion-graphics layer"
+_OTHER_MARK = "\n## Other styles"
+_CORE, _rest = SYSTEM.split(_FX_MARK, 1)
+_FX_FULL, _OTHER = _rest.split(_OTHER_MARK, 1)
+_FX_FULL = _FX_MARK + _FX_FULL
+_OTHER = _OTHER_MARK + _OTHER
+_FX_SLIM = """
+## Motion graphics (fx layer, loaded by the skeleton)
+Make it cinematic, never a slide deck. <body data-theme="blue|sunset|emerald|crimson|gold|mono" data-bg="particles|network|stars|aurora|grid|waves|rain" data-post="vignette grain">. Every scene gets a hero visual: <div class="hero3d" data-shape="torusknot|icosa|globe|crystal|rings" style="--size:640px"></div> (max 1 per scene), or <div class="fx-bars" data-values="1,2,3" data-labels="a,b,c">, <div class="fx-donut" data-value="80" data-suffix="%">, <div class="fx-line" data-values="1,3,2,5">, an inline SVG, or a big number. Headlines: data-split="chars|words" data-kin="rise|drop|blur|flip|wave|zoom|spin|glitch" (also .neon .fx-gradient). Camera moves are automatic; vary data-transition (zoom slide wipe curtain slice flip blur spin rise glitch). Ambient: .bob .breathe .spin-slow .glow .shine .blob .orbit.
+"""
+_OTHER_KEYWORDS = re.compile(
+    r"3d|three\.?js|webgl|math|equation|calculus|theorem|proof|3blue|manim|vector|derivative|integral|"
+    r"cartoon|character|squash|mascot|animated explainer|svg animation", re.IGNORECASE)
+
+def build_system(user_text: str = "", slim: bool = False) -> str:
+    """Core rules always; the long style sections only when they help (they cost ~1.5k tokens)."""
+    parts = [_CORE, _FX_SLIM if slim else _FX_FULL]
+    if not slim and _OTHER_KEYWORDS.search(user_text or ""):
+        parts.append(_OTHER)
+    return "".join(parts)
 
 def _tool_schemas():
     return [
@@ -299,7 +321,7 @@ def _path_was_supplied_by_user(source_path, supplied_text: str) -> bool:
         return False
     return p in supplied_text or p.replace("\\", "/") in supplied_text.replace("\\", "/")
 
-def _call_tool(project_id, name, args, supplied_text=""):
+def _call_tool(project_id, name, args, supplied_text="", emit=None):
     if name == "install_design_kit":
         return install_design_kit(project_id)
     if name == "write_storyboard":
@@ -347,7 +369,7 @@ def _call_tool(project_id, name, args, supplied_text=""):
     if name == "validate_project":
         return validate(project_id)
     if name == "render_video":
-        return render(project_id, int(args["width"]), int(args["height"]), int(args["fps"]))
+        return render(project_id, int(args["width"]), int(args["height"]), int(args["fps"]), on_progress=emit)
     raise ValueError(f"Unknown tool: {name}")
 
 def _summarize_call(name: str, args: dict) -> str:
@@ -375,6 +397,23 @@ def _compact_call(call: dict, args: dict, result_ok: bool) -> None:
 def _clip(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + f"... [truncated {len(text) - limit} chars]"
 
+def _shrink_history(messages: list, level: int) -> None:
+    """Make the conversation cheaper in place, never dropping a message (tool_call pairs must stay intact)."""
+    keep_tail = 6
+    for i, m in enumerate(messages):
+        if m["role"] == "tool":
+            old = i < len(messages) - keep_tail
+            if level >= 2 and old:
+                ok = '"ok": false' not in m["content"][:30]
+                m["content"] = '{"ok": true, "result": "[omitted]"}' if ok else _clip(m["content"], 300)
+            else:
+                m["content"] = _clip(m["content"], 600 if level >= 1 else MAX_TOOL_OUTPUT_CHARS)
+        elif m["role"] == "assistant" and level >= 1 and len(m.get("content") or "") > 400:
+            m["content"] = m["content"][:400] + "..."
+
+def _request_estimate(messages, tools) -> int:
+    return llm.estimate_tokens(messages) + llm.estimate_tokens(tools)
+
 def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     """Drive the model until the video is built. `on_event(str)` receives live progress lines."""
     if not GROQ_API_KEY:
@@ -397,8 +436,10 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
         "instruction": instruction or "Build the complete video from the project's original prompt. Validate and render it.",
     }
 
+    user_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
+    slim = llm.learned_limit is not None  # a previous run hit a request-size limit: start small
     messages = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": build_system(user_text, slim)},
         {"role": "user", "content": json.dumps(user_message, indent=2)},
     ]
     # Text the user wrote themselves: the only place a host path may come from.
@@ -406,17 +447,43 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     usage = llm.Usage()
     tools = _tool_schemas()
 
+    shrink_level = 0
     for turn in range(1, MAX_TURNS + 1):
         emit(f"Thinking (step {turn})…")
-        response = llm.complete(
-            client,
-            usage=usage,
-            model=GROQ_MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.2,
-        )
+        while True:
+            # Stay under a request-size limit we already know about (413 from an earlier call).
+            if llm.learned_limit and _request_estimate(messages, tools) > llm.learned_limit * 0.85 and shrink_level < 3:
+                shrink_level += 1
+                _shrink_history(messages, shrink_level)
+                if shrink_level == 3 and not slim:
+                    slim = True
+                    messages[0]["content"] = build_system(user_text, True)
+                continue
+            try:
+                response = llm.complete(
+                    client,
+                    usage=usage,
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.2,
+                )
+                break
+            except llm.RequestTooLarge as exc:
+                if shrink_level >= 3 and slim:
+                    raise RuntimeError(
+                        "The model rejected the request as too large even after shrinking it "
+                        f"({exc.requested or '?'} tokens, limit {exc.limit or '?'}). Your Groq plan/model allows too few "
+                        "tokens per request for this agent: use a model with a larger limit (GROQ_MODEL / "
+                        "GROQ_FALLBACK_MODEL) or upgrade the plan. Details: " + str(exc)
+                    ) from exc
+                emit(f"Request too large for the model (limit {exc.limit or 'unknown'}); shrinking context and retrying…")
+                shrink_level = min(3, shrink_level + 1)
+                _shrink_history(messages, shrink_level)
+                if not slim:
+                    slim = True
+                    messages[0]["content"] = build_system(user_text, True)
 
         msg = response.choices[0].message
         assistant = {"role": "assistant", "content": msg.content or ""}
@@ -447,7 +514,7 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                 if not isinstance(args, dict):
                     raise ValueError("Tool arguments must be a JSON object.")
                 emit(_summarize_call(tc.function.name, args))
-                result = _call_tool(project_id, tc.function.name, args, supplied_text)
+                result = _call_tool(project_id, tc.function.name, args, supplied_text, emit)
                 tool_output = {"ok": True, "result": result}
             except Exception as exc:
                 tool_output = {"ok": False, "error": str(exc)}

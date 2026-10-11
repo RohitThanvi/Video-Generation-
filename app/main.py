@@ -75,7 +75,7 @@ def start_job(project_id: str, req: JobRequest):
         else:
             def fn(emit):
                 emit(f"Rendering {req.width}x{req.height} at {req.fps} fps (frame by frame, this takes a while)…")
-                return render(project_id, req.width, req.height, req.fps)
+                return render(project_id, req.width, req.height, req.fps, on_progress=emit)
         job = jobs.manager.submit(project_id, req.kind, fn)
     except jobs.JobConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))

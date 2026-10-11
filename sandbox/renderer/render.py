@@ -140,7 +140,7 @@ def plan_audio(project: Path, scenes):
 
 # ------------------------------------------------------------------ ffmpeg
 
-def build_ffmpeg_cmd(dst: Path, fps: int, total: float, tracks):
+def build_ffmpeg_cmd(dst: Path, fps: int, total: float, tracks, size=None):
     """ffmpeg command that reads PNG frames from stdin and mixes the narration tracks."""
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -174,7 +174,9 @@ def build_ffmpeg_cmd(dst: Path, fps: int, total: float, tracks):
     cmd += [
         # Screenshots are full-range sRGB; players expect limited-range BT.709 for HD video.
         # Converting explicitly keeps colours (and pure black backgrounds) correct.
-        "-vf", "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p",
+        # `size` = (w, h): frames were captured smaller (time budget) and are scaled back up.
+        "-vf", (f"scale={size[0]}:{size[1]}:flags=lanczos," if size else "")
+        + "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p",
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         "-c:v", "libx264",
         "-preset", "medium",
@@ -190,10 +192,10 @@ def build_ffmpeg_cmd(dst: Path, fps: int, total: float, tracks):
 class Encoder:
     """Streams PNG frames into ffmpeg."""
 
-    def __init__(self, dst: Path, fps: int, total: float, tracks):
+    def __init__(self, dst: Path, fps: int, total: float, tracks, size=None):
         self._log = tempfile.TemporaryFile()
         self._proc = subprocess.Popen(
-            build_ffmpeg_cmd(dst, fps, total, tracks),
+            build_ffmpeg_cmd(dst, fps, total, tracks, size),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=self._log,
@@ -407,7 +409,94 @@ WAIT_READY_JS = """async (timeoutMs) => {
 }"""
 
 
-def render(project: Path, width: int, height: int, fps: int):
+# (resolution scale, fps cap) in order of preference. The first one whose projected render time
+# fits the budget wins; the requested fps is used when it is lower than the cap.
+BUDGET_LADDER = [(1.0, None), (1.0, 24), (0.75, 24), (1.0, 15), (0.75, 15), (0.5, 24), (0.5, 15), (0.5, 12)]
+CALIBRATION_FRAMES = 4
+
+
+def open_page(browser, port, width, height, scale, fps, total, scenes_json, runtime_js, note=None):
+    """New context + page at the given resolution scale, with the virtual clock installed."""
+    frames = max(1, round(total * fps))
+    context = browser.new_context(
+        viewport={"width": width, "height": height}, device_scale_factor=scale
+    )
+    context.add_init_script(
+        script=(
+            "window.__VIDEO_EXPORT__ = true;"
+            f"window.__VIDEO_FPS__ = {int(fps)};"
+            f"window.__VIDEO_TOTAL__ = {float(total)};"
+            f"window.__VIDEO_FRAMES__ = {int(frames)};"
+            f"window.__VIDEO_WIDTH__ = {int(width)};"
+            f"window.__VIDEO_HEIGHT__ = {int(height)};"
+            # Scene ids + durations from storyboard.json: the page's scene engine
+            # (kit.js) reads these, so HTML timing cannot disagree with the storyboard.
+            f"window.__VIDEO_SCENES__ = {scenes_json};"
+        )
+        + runtime_js
+    )
+    page = context.new_page()
+    if note:
+        page.on("console", lambda m: note("console.error", m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: note("pageerror", e))
+        page.on("requestfailed", lambda r: note("requestfailed", f"{r.url} ({r.failure})"))
+        page.on("response", lambda r: note("http %d" % r.status, r.url) if r.status >= 400 else None)
+    page.goto(f"http://127.0.0.1:{port}/source/index.html", wait_until="load")
+    page.evaluate(WAIT_READY_JS, READY_TIMEOUT_MS)
+    # First tick: runs initial rAF callbacks / timers due at t=0 and lays the page out, which is
+    # when any web fonts actually start loading.
+    page.evaluate("() => window.__vclock.advance(0, 0)")
+    page.evaluate(WAIT_READY_JS, READY_TIMEOUT_MS)
+    return context, page, context.new_cdp_session(page)
+
+
+def measure_frame_seconds(browser, port, width, height, scale, total, scenes_json, runtime_js, give_up_after=90.0):
+    """Average seconds per captured frame, sampled across the timeline (one warm-up first)."""
+    context, page, cdp = open_page(browser, port, width, height, scale, 30, total, scenes_json, runtime_js)
+    try:
+        cdp.send("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True})  # warm-up
+        costs, started = [], time.monotonic()
+        for k in range(CALIBRATION_FRAMES):
+            t = total * (0.15 + 0.7 * k / max(1, CALIBRATION_FRAMES - 1))
+            t0 = time.monotonic()
+            page.evaluate("([t, i]) => window.__vclock.advance(t, i)", [t * 1000.0, k + 1])
+            cdp.send("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True})
+            costs.append(time.monotonic() - t0)
+            if time.monotonic() - started > give_up_after:
+                break
+        return sum(costs) / len(costs)
+    finally:
+        context.close()
+
+
+def choose_settings(requested_fps, total, budget_seconds, measure):
+    """Pick (scale, fps, projected_seconds, adjusted) so the projected render fits the budget.
+
+    `measure(scale)` returns seconds per frame at that scale. Calibration results are cached.
+    """
+    cache = {}
+
+    def per_frame(scale):
+        if scale not in cache:
+            cache[scale] = measure(scale)
+        return cache[scale]
+
+    candidates = []
+    for scale, cap in BUDGET_LADDER:
+        fps = requested_fps if cap is None else min(requested_fps, cap)
+        if (scale, fps) not in candidates:
+            candidates.append((scale, fps))
+    best = None
+    for scale, fps in candidates:
+        projected = max(1, round(total * fps)) * per_frame(scale) * 1.1  # +10%: encoding, startup
+        best = (scale, fps, projected)
+        if projected <= budget_seconds:
+            break
+    scale, fps, projected = best
+    return scale, fps, projected, (scale, fps) != (1.0, requested_fps)
+
+
+def render(project: Path, width: int, height: int, fps: int, budget_seconds: float = 0):
     # Imported here so the pure helpers above can be used (and tested) without Playwright.
     from playwright.sync_api import sync_playwright
 
@@ -417,7 +506,7 @@ def render(project: Path, width: int, height: int, fps: int):
 
     storyboard, total = load_storyboard(project)
     tracks = plan_audio(project, storyboard["scenes"])
-    frames = max(1, round(total * fps))
+    requested_fps = fps
 
     out_dir = project / "renders" / "final"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -438,66 +527,66 @@ def render(project: Path, width: int, height: int, fps: int):
     )
     server = start_server(project)
     port = server.server_address[1]
-    encoder = Encoder(mp4, fps, total, tracks)
     started = time.monotonic()
+    encoder = None
+    adjustment = None
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 executable_path=chromium_path(), headless=True, args=CHROMIUM_ARGS
             )
-            context = browser.new_context(
-                viewport={"width": width, "height": height}, device_scale_factor=1
-            )
-            context.add_init_script(
-                script=(
-                    "window.__VIDEO_EXPORT__ = true;"
-                    f"window.__VIDEO_FPS__ = {int(fps)};"
-                    f"window.__VIDEO_TOTAL__ = {float(total)};"
-                    f"window.__VIDEO_FRAMES__ = {int(frames)};"
-                    f"window.__VIDEO_WIDTH__ = {int(width)};"
-                    f"window.__VIDEO_HEIGHT__ = {int(height)};"
-                    # Scene ids + durations from storyboard.json: the page's scene engine
-                    # (kit.js) reads these, so HTML timing cannot disagree with the storyboard.
-                    f"window.__VIDEO_SCENES__ = {scenes_json};"
+            scale = 1.0
+            if budget_seconds and budget_seconds > 0:
+                print("progress: measuring render speed to fit the time budget...", file=sys.stderr, flush=True)
+                scale, fps, projected, adjusted = choose_settings(
+                    requested_fps, total, budget_seconds,
+                    lambda sc: measure_frame_seconds(browser, port, width, height, sc, total, scenes_json, runtime_js),
                 )
-                + runtime_js
-            )
-            page = context.new_page()
-            page.on("console", lambda m: note("console.error", m.text) if m.type == "error" else None)
-            page.on("pageerror", lambda e: note("pageerror", e))
-            page.on("requestfailed", lambda r: note("requestfailed", f"{r.url} ({r.failure})"))
-            page.on(
-                "response",
-                lambda r: note("http %d" % r.status, r.url) if r.status >= 400 else None,
-            )
+                if adjusted:
+                    adjustment = {
+                        "requested": {"width": width, "height": height, "fps": requested_fps},
+                        "rendered": {"width": round(width * scale), "height": round(height * scale), "fps": fps},
+                        "projected_seconds": round(projected),
+                        "budget_seconds": budget_seconds,
+                        "reason": "projected render time exceeded the budget; output is scaled to the requested size",
+                    }
+                    print(
+                        f"progress: adjusted to {round(width * scale)}x{round(height * scale)} at {fps} fps "
+                        f"(about {round(projected / 60)} min)", file=sys.stderr, flush=True,
+                    )
+                else:
+                    print(f"progress: full quality fits (about {round(projected / 60)} min)", file=sys.stderr, flush=True)
 
-            page.goto(f"http://127.0.0.1:{port}/source/index.html", wait_until="load")
-            page.evaluate(WAIT_READY_JS, READY_TIMEOUT_MS)
-            # First tick: runs initial rAF callbacks / timers due at t=0 and lays the page
-            # out, which is when any web fonts actually start loading.
-            page.evaluate("() => window.__vclock.advance(0, 0)")
-            page.evaluate(WAIT_READY_JS, READY_TIMEOUT_MS)
-
-            cdp = context.new_cdp_session(page)
+            frames = max(1, round(total * fps))
+            # Capture size must be even for H.264; the encoder scales back to the requested size.
+            size = (width, height) if scale != 1.0 else None
+            encoder = Encoder(mp4, fps, total, tracks, size)
+            context, page, cdp = open_page(browser, port, width, height, scale, fps, total, scenes_json, runtime_js, note)
+            loop_start, last_report = time.monotonic(), 0.0
             for i in range(frames):
                 if i > 0:
                     page.evaluate("([t, i]) => window.__vclock.advance(t, i)", [i * 1000.0 / fps, i])
                 shot = cdp.send("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True})
                 encoder.write(base64.b64decode(shot["data"]))
-                if frames >= 20 and i % max(1, frames // 10) == 0:
-                    print(f"frame {i}/{frames}", file=sys.stderr, flush=True)
+                elapsed = time.monotonic() - loop_start
+                if elapsed - last_report >= 5 or i == frames - 1:
+                    last_report = elapsed
+                    eta = elapsed / (i + 1) * (frames - i - 1)
+                    print(f"progress: frame {i + 1}/{frames} ({round(100 * (i + 1) / frames)}%), about {round(eta / 60, 1)} min left",
+                          file=sys.stderr, flush=True)
 
             context.close()
             browser.close()
         encoder.close()
     except BaseException:
-        encoder.abort()
+        if encoder:
+            encoder.abort()
         raise
     finally:
         server.shutdown()
 
-    print(json.dumps({
+    result = {
         "ok": True,
         "duration_seconds": total,
         "frames": frames,
@@ -506,7 +595,10 @@ def render(project: Path, width: int, height: int, fps: int):
         "output": str(mp4),
         "audio": [{"file": clip.name, "start_seconds": round(start, 3)} for clip, start in tracks],
         "browser_messages": browser_messages,
-    }))
+    }
+    if adjustment:
+        result["adjusted"] = adjustment
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":
@@ -515,5 +607,6 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--fps", type=int, required=True)
+    parser.add_argument("--budget", type=float, default=0, help="max render seconds; 0 = never reduce quality")
     args = parser.parse_args()
-    render(Path(args.project), args.width, args.height, args.fps)
+    render(Path(args.project), args.width, args.height, args.fps, args.budget)
