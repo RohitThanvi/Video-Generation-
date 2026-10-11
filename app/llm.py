@@ -135,6 +135,11 @@ class Usage:
 
 _limiter = TokenLimiter(config.LLM_TPM, config.LLM_RPM)
 _slots = threading.BoundedSemaphore(max(1, config.LLM_CONCURRENCY))
+# Models other than the core one (small model, fallback) are limited by the provider separately, so
+# each gets its own window and its own concurrency cap: a burst of narration requests to the small
+# model must never eat the core model's tokens-per-minute.
+_side_lanes: dict[str, tuple[TokenLimiter, threading.BoundedSemaphore]] = {}
+_lanes_lock = threading.Lock()
 _TRANSIENT = (APIConnectionError, APITimeoutError, InternalServerError)
 
 
@@ -142,26 +147,41 @@ def get_limiter() -> TokenLimiter:
     return _limiter
 
 
+def _lane(model: str, primary: str):
+    """(limiter, semaphore) for `model`; the request's primary model uses the shared core lane."""
+    if model == config.GROQ_MODEL or (model == primary and model != config.GROQ_SMALL_MODEL):
+        return _limiter, _slots
+    with _lanes_lock:
+        if model not in _side_lanes:
+            _side_lanes[model] = (
+                TokenLimiter(config.LLM_TPM_SMALL, config.LLM_RPM_SMALL),
+                threading.BoundedSemaphore(max(1, config.LLM_CONCURRENCY_SMALL)),
+            )
+        return _side_lanes[model]
+
+
 def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None, **kwargs):
     """chat.completions.create with budgeting, retry and model fallback."""
     models = [kwargs.pop("model")]
+    primary = models[0]
     if config.GROQ_FALLBACK_MODEL and config.GROQ_FALLBACK_MODEL not in models:
         models.append(config.GROQ_FALLBACK_MODEL)
     estimate = estimate_tokens(kwargs.get("messages")) + estimate_tokens(kwargs.get("tools")) + 1500
     last_exc = None
     for model in models:
+        limiter, slots = _lane(model, primary)
         for attempt in range(MAX_RETRIES):
-            entry = _limiter.acquire(estimate, on_wait)
+            entry = limiter.acquire(estimate, on_wait)
             try:
-                with _slots:
+                with slots:
                     response = client.chat.completions.create(model=model, **kwargs)
             except RateLimitError as exc:
-                _limiter.settle(entry, 0)
+                limiter.settle(entry, 0)
                 last_exc = exc
                 delay = retry_after_seconds(exc)
                 if delay is None:
                     delay = min(2 ** attempt * 5, 60)
-                _limiter.penalize(delay)
+                limiter.penalize(delay)
                 if usage:
                     usage.retries += 1
                     usage.waited_seconds += delay + 0.5
@@ -171,7 +191,7 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
                     sleep(delay + 0.5)
                 continue
             except _TRANSIENT as exc:
-                _limiter.settle(entry, 0)
+                limiter.settle(entry, 0)
                 last_exc = exc
                 delay = min(2 ** attempt, 20)
                 if usage:
@@ -181,7 +201,7 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
                     sleep(delay)
                 continue
             except APIStatusError as exc:
-                _limiter.settle(entry, 0)
+                limiter.settle(entry, 0)
                 if getattr(exc, "status_code", None) == 413:
                     err = _parse_too_large(exc)
                     global learned_limit
@@ -192,7 +212,7 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
                 raise
             u = getattr(response, "usage", None)
             total = getattr(u, "total_tokens", None) if u else None
-            _limiter.settle(entry, total)
+            limiter.settle(entry, total)
             if usage:
                 usage.calls += 1
                 usage.models.add(model)
@@ -201,3 +221,31 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
                     usage.completion_tokens += getattr(u, "completion_tokens", 0) or 0
             return response
     raise last_exc
+
+
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+
+
+def small_model() -> str:
+    return config.GROQ_SMALL_MODEL or config.GROQ_MODEL
+
+
+def ask_small(client, system: str, user: str, usage: Usage | None = None, on_wait=None, max_tokens: int = 1500) -> str:
+    """One plain-text completion on the small model, falling back to the core model if it fails.
+
+    For work a small model does well and that would otherwise burn core tokens: writing narration,
+    rephrasing, short repairs. Returns the text with any <think> block removed.
+    """
+    last = None
+    for model in dict.fromkeys([small_model(), config.GROQ_MODEL]):
+        try:
+            response = complete(
+                client, usage=usage, on_wait=on_wait, model=model, temperature=0.5, max_tokens=max_tokens,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": "/no_think\n" + user}],
+            )
+            text = _THINK.sub("", response.choices[0].message.content or "").strip()
+            if text:
+                return text
+        except Exception as exc:  # noqa: BLE001 - any failure of the small model falls through to the next
+            last = exc
+    raise last or RuntimeError("The model returned no text.")

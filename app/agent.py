@@ -13,7 +13,10 @@ MAX_TOOL_OUTPUT_CHARS = 3000
 MAX_TURNS = 30
 # Tools whose arguments are big (whole files). Once saved, history keeps only a stub, so the
 # model is not charged for re-reading its own file on every later turn.
-_BULKY_ARGS = {"write_source": "content", "save_text_asset": "content", "write_storyboard": "storyboard"}
+_BULKY_ARGS = {"write_source": "content", "save_text_asset": "content"}
+# The storyboard is small and the model must keep seeing it (it plans narration/durations from it), so
+# it is never stubbed; other arguments are only stubbed when big enough to matter.
+MIN_STUB_CHARS = 1500
 
 SYSTEM = r"""
 You are the director/engineering agent for a deterministic HTML-to-video compiler. You build a
@@ -97,6 +100,31 @@ ART DIRECTION. The goal is a cinematic motion-graphics video, never a slide deck
 Create a polished explainer with real content and real visuals, not placeholders.
 """
 
+
+_ENGINE = """You are the creative director of an automated video studio. A tested engine does all the mechanics (layout, kinetic type, 3D, charts, camera moves, transitions, photo download, narration writing + speech, timing, rendering). You only decide WHAT the video says and shows. Do not write HTML.
+
+## Workflow
+1. build_video(spec) ONCE with the whole video (5-8 scenes). It returns a summary.
+2. render_video(1920,1080,30). Done. (validate_project only if something failed.)
+To change something afterwards use patch_scene (one scene or the look), never rebuild everything.
+
+## spec
+{"title":"...","theme":"blue|sunset|emerald|crimson|gold|mono","bg":"particles|network|stars|aurora|grid|waves|rain","post":"vignette",
+ "scenes":[{"id":"intro","layout":"title","headline":"max 8 words","kicker":"short label","body":"one sentence (optional)",
+   "say":"the talking points for the voice-over, 1-2 sentences of facts","visual":{...},"transition":"zoom","duration":6}]}
+Look: pick theme+bg from the topic (space=stars, tech/AI=network|rain, nature=aurora|waves, retro=grid, general=particles). Per-video, not per-scene.
+Layouts: title (opener/closer, centered), split (text + visual), chart (text + chart), stat (one giant counting number), list (3-6 cards with icons), steps (numbered cards), quote, compare (left/right with items), photo (text + big photo), custom (your own "html"+"css", only if no layout fits).
+visual: {"type":"hero3d","shape":"torusknot|icosa|globe|crystal|rings"} (max 3 per video) | {"type":"bars","values":[..],"labels":[..],"suffix":"k"} | {"type":"line","values":[..]} | {"type":"donut","value":87,"suffix":"%","label":".."} | {"type":"photo","query":"search words"} (real free photo, downloaded for you) | {"type":"blob"} | {"type":"icon","name":"rocket"} | {"type":"number","value":1969,"label":".."}
+Other fields: list/steps -> "items":[{"title","text","icon"}]; stat -> "stat":{"value","prefix","suffix","label"}; quote -> "quote","by"; compare -> "left":{"title","items":[{"title"}]},"right":{..}; optional "kin" (rise|drop|blur|flip|wave|zoom|spin|glitch), "cam" (push|pull|left|right|drift|tilt|none), "transition" (zoom|slide|wipe|curtain|slice|flip|blur|spin|rise|glitch).
+Icons: rocket globe moon sun star zap clock check arrow chart users lightbulb target layers shield flag play satellite.
+
+## Craft rules
+- Open with the most striking scene, vary layouts (never 3 of the same in a row), end on a bold closing title. Use real numbers/facts from the topic in charts and stats.
+- Short headlines (<= 8 words). "say" holds facts, not finished prose: a small model writes the voice-over from it (or give exact words in "narration").
+- Scenes get as long as their narration needs; "duration" is only the minimum (default 6).
+- Omit "visual" and the engine picks one. Use photo for real-world subjects (places, people, animals, products).
+"""
+
 _FX_MARK = "\n## Motion-graphics layer"
 _OTHER_MARK = "\n## Other styles"
 _CORE, _rest = SYSTEM.split(_FX_MARK, 1)
@@ -108,18 +136,55 @@ _FX_SLIM = """
 Make it cinematic, never a slide deck. <body data-theme="blue|sunset|emerald|crimson|gold|mono" data-bg="particles|network|stars|aurora|grid|waves|rain" data-post="vignette grain">. Every scene gets a hero visual: <div class="hero3d" data-shape="torusknot|icosa|globe|crystal|rings" style="--size:640px"></div> (max 1 per scene), or <div class="fx-bars" data-values="1,2,3" data-labels="a,b,c">, <div class="fx-donut" data-value="80" data-suffix="%">, <div class="fx-line" data-values="1,3,2,5">, an inline SVG, or a big number. Headlines: data-split="chars|words" data-kin="rise|drop|blur|flip|wave|zoom|spin|glitch" (also .neon .fx-gradient). Camera moves are automatic; vary data-transition (zoom slide wipe curtain slice flip blur spin rise glitch). Ambient: .bob .breathe .spin-slow .glow .shine .blob .orbit.
 """
 _OTHER_KEYWORDS = re.compile(
-    r"3d|three\.?js|webgl|math|equation|calculus|theorem|proof|3blue|manim|vector|derivative|integral|"
+    r"three\.?js|webgl|math|equation|calculus|theorem|proof|3blue|manim|vector|derivative|integral|"
     r"cartoon|character|squash|mascot|animated explainer|svg animation", re.IGNORECASE)
 
 def build_system(user_text: str = "", slim: bool = False) -> str:
-    """Core rules always; the long style sections only when they help (they cost ~1.5k tokens)."""
-    parts = [_CORE, _FX_SLIM if slim else _FX_FULL]
-    if not slim and _OTHER_KEYWORDS.search(user_text or ""):
-        parts.append(_OTHER)
-    return "".join(parts)
+    """Engine prompt (small, ~1k tokens) for ordinary videos. 3D / math / cartoon requests keep the
+    hand-written-page prompt, since those styles are not compiled by the scene engine."""
+    if _OTHER_KEYWORDS.search(user_text or ""):
+        return _CORE + (_FX_SLIM if slim else _FX_FULL) + (_OTHER if not slim else "")
+    return _ENGINE
 
-def _tool_schemas():
+def is_engine_mode(user_text: str = "") -> bool:
+    return not _OTHER_KEYWORDS.search(user_text or "")
+
+_ENGINE_TOOLS = {"build_video", "patch_scene", "validate_project", "render_video", "read_source", "patch_source",
+                 "write_source", "ingest_host_asset"}
+_LEGACY_HIDDEN = {"build_video", "patch_scene"}
+
+
+def _tool_schemas(engine: bool = False):
+    """Engine mode exposes few, high-level tools (smaller prompt, fewer turns); legacy mode the low-level set."""
+    allowed = lambda name: (name in _ENGINE_TOOLS) if engine else (name not in _LEGACY_HIDDEN)
+    return [t for t in _all_tool_schemas() if allowed(t["function"]["name"])]
+
+
+def _all_tool_schemas():
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "build_video",
+                "description": "Compile the whole video from a scene spec (see system prompt): downloads photos, writes+voices the narration, builds storyboard and page. Call once.",
+                "parameters": {"type": "object", "properties": {"spec": {"type": "object"}}, "required": ["spec"]},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "patch_scene",
+                "description": "Edit the saved spec and rebuild (unchanged scenes keep their narration/audio). scene_id + fields changes or adds a scene (insert_after to place it); remove:true deletes it; video:{theme,bg,post,title} changes the look.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scene_id": {"type": "string"}, "fields": {"type": "object"}, "insert_after": {"type": "string"},
+                        "remove": {"type": "boolean"}, "video": {"type": "object"},
+                    },
+                    "required": ["scene_id"],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -324,7 +389,15 @@ def _path_was_supplied_by_user(source_path, supplied_text: str) -> bool:
         return False
     return p in supplied_text or p.replace("\\", "/") in supplied_text.replace("\\", "/")
 
-def _call_tool(project_id, name, args, supplied_text="", emit=None):
+def _call_tool(project_id, name, args, supplied_text="", emit=None, writer_for=None):
+    if name == "build_video":
+        from . import engine
+        return engine.build_video(project_id, args["spec"], write_narration=(writer_for(emit) if writer_for else None), emit=emit)
+    if name == "patch_scene":
+        from . import engine
+        return engine.patch_scene(project_id, args["scene_id"], args.get("fields"), args.get("insert_after"),
+                                  bool(args.get("remove")), args.get("video"),
+                                  write_narration=(writer_for(emit) if writer_for else None), emit=emit)
     if name == "install_design_kit":
         return install_design_kit(project_id)
     if name == "write_storyboard":
@@ -382,6 +455,12 @@ def _summarize_call(name: str, args: dict) -> str:
             return f"{name} {args[key][:80]}"
     if name == "generate_narrations":
         return f"{name} ({len(args.get('clips') or [])} clips)"
+    if name == "build_video":
+        spec = args.get("spec")
+        n = len(spec.get("scenes") or []) if isinstance(spec, dict) else "?"
+        return f"build_video ({n} scenes)"
+    if name == "patch_scene":
+        return f"patch_scene {str(args.get('scene_id'))[:40]}"
     if name == "render_video":
         return f"{name} {args.get('width')}x{args.get('height')}@{args.get('fps')}"
     return name
@@ -393,6 +472,8 @@ def _compact_call(call: dict, args: dict, result_ok: bool) -> None:
         return
     value = args[key]
     size = len(value) if isinstance(value, str) else len(json.dumps(value, default=str))
+    if size < MIN_STUB_CHARS:
+        return
     stub = dict(args)
     stub[key] = f"[saved {size} chars]"
     call["function"]["arguments"] = json.dumps(stub)
@@ -417,7 +498,7 @@ def _shrink_history(messages: list, level: int) -> None:
 def _request_estimate(messages, tools) -> int:
     return llm.estimate_tokens(messages) + llm.estimate_tokens(tools)
 
-_MUTATING_TOOLS = {"write_source", "patch_source", "write_storyboard", "generate_narration", "generate_narrations", "save_text_asset", "install_design_kit"}
+_MUTATING_TOOLS = {"build_video", "patch_scene", "write_source", "patch_source", "write_storyboard", "generate_narration", "generate_narrations", "save_text_asset", "install_design_kit"}
 
 def _finish_ourselves(project_id: str, emit, reason: str, usage, recent: list, final_message: str | None = None):
     """The model is not converging (loop, time limit, forgot to render): complete the pipeline in code.
@@ -426,6 +507,14 @@ def _finish_ourselves(project_id: str, emit, reason: str, usage, recent: list, f
     and what the model did last, so the problem can be diagnosed instead of a bare 'maximum iterations'.
     """
     emit(f"Finishing the video automatically ({reason})…")
+    from .tools import build_fallback_page
+    try:
+        built = build_fallback_page(project_id)
+    except Exception as exc:  # no storyboard yet: nothing to build from
+        built = None
+        emit(f"Could not build a fallback page: {str(exc)[:120]}")
+    if built:
+        emit(f"The model never wrote source/index.html, so a page was built from its storyboard ({built['scenes']} scenes).")
     check = validate_project(project_id, require_renderable=True)
     if not check["valid"] and final_message is not None:
         # The model said it was finished but the project cannot render: report, do not raise.
@@ -482,7 +571,10 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     # Text the user wrote themselves: the only place a host path may come from.
     supplied_text = f"{manifest.get('prompt') or ''}\n{instruction or ''}"
     usage = llm.Usage()
-    tools = _tool_schemas()
+    engine_mode = is_engine_mode(user_text)
+    tools = _tool_schemas(engine_mode)
+    from . import engine as _engine
+    _writer = lambda emit_: _engine.make_narration_writer(client, usage, emit_)
 
     shrink_level = 0
     started = time.monotonic()
@@ -493,6 +585,13 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
         if time.monotonic() - started > AGENT_MAX_SECONDS:
             return _finish_ourselves(project_id, emit, f"time limit of {AGENT_MAX_SECONDS}s reached", usage, recent)
         emit(f"Thinking (step {turn})…")
+        if usage.retries >= 2 and not slim:
+            # Repeated 429s: every token costs waiting time, so send less per call from now on.
+            slim = True
+            messages[0]["content"] = build_system(user_text, True)
+            shrink_level = max(shrink_level, 1)
+            _shrink_history(messages, shrink_level)
+            emit("The API keeps rate-limiting; switching to a shorter prompt to go faster.")
         while True:
             # Stay under a request-size limit we already know about (413 from an earlier call).
             if llm.learned_limit and _request_estimate(messages, tools) > llm.learned_limit * 0.85 and shrink_level < 3:
@@ -561,7 +660,7 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                 if not isinstance(args, dict):
                     raise ValueError("Tool arguments must be a JSON object.")
                 emit(_summarize_call(tc.function.name, args))
-                result = _call_tool(project_id, tc.function.name, args, supplied_text, emit)
+                result = _call_tool(project_id, tc.function.name, args, supplied_text, emit, writer_for=_writer)
                 tool_output = {"ok": True, "result": result}
             except Exception as exc:
                 tool_output = {"ok": False, "error": str(exc)}

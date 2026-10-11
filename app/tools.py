@@ -244,6 +244,30 @@ def generate_narration(project_id: str, filename: str, text: str, rate: int = 17
         info["min_scene_duration_seconds"] = min_scene_seconds(seconds)
     return info
 
+def build_fallback_page(project_id: str, overwrite: bool = False):
+    """Safety net: if the model stalled before writing the page, compile one from the storyboard.
+
+    Uses the scene engine, so the result has the same quality as a normal build (3D heroes,
+    kinetic titles, photos, transitions). Narration that was never generated is dropped.
+    """
+    from . import engine
+
+    root = require_project_dir(project_id)
+    if (root / "source" / "index.html").exists() and not overwrite:
+        return None
+    if not (root / "storyboard.json").is_file():
+        raise ValueError("storyboard.json does not exist yet.")
+    spec = engine.spec_from_storyboard(project_id)
+    out = engine.build_video(project_id, spec, narrate=False)
+    # build_video rewrote the storyboard without narration; restore clips that do exist.
+    board = json.loads((root / "storyboard.json").read_text(encoding="utf-8"))
+    for sc in board["scenes"]:
+        if (root / "narration" / f"{sc['id']}.wav").is_file():
+            sc["narration"] = f"{sc['id']}.wav"
+    (root / "storyboard.json").write_text(json.dumps(board, indent=2), encoding="utf-8")
+    return {"path": "source/index.html", "scenes": out["scenes"], "theme": out["theme"], "background": out["background"]}
+
+
 def generate_narrations(project_id: str, clips: list):
     """Generate several narration clips in one tool call, in parallel (one LLM turn, not N)."""
     if not isinstance(clips, list) or not clips:

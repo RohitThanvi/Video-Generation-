@@ -368,14 +368,18 @@ def test_agent_reports_unknown_tools_by_name(project, monkeypatch):
     assert out["ok"] is False and "rm_rf" in out["error"]
 
 
-def test_agent_can_write_storyboard_sent_as_a_string(project, monkeypatch):
+def test_agent_can_write_storyboard_sent_as_a_string(project, monkeypatch, fake_sandbox):
     sb = json.dumps({"scenes": [{"id": "s1", "duration_seconds": 4}]})
     args = json.dumps({"storyboard": sb})
     seen = _install_fake_llm(
         monkeypatch,
         [_response(tool_calls=[_tool_call("c1", "write_storyboard", args)]), _response("done")],
     )
-    agent.run_agent(project, None)
+    fake_sandbox.creates = ["renders/final/final.mp4"]
+    try:
+        agent.run_agent(project, None)
+    except RuntimeError:
+        pass  # the supervisor may try to render with the fake sandbox
     assert _last_tool_output(seen[1])["ok"] is True
     assert (project_dir(project) / "storyboard.json").is_file()
 
@@ -518,3 +522,28 @@ def test_fx_engine_is_syntactically_valid_javascript(tmp_path):
     kit = Path(tools.__file__).parent / "kit"
     for name in ("fx.js", "kit.js"):
         subprocess.run(["node", "--check", str(kit / name)], check=True, capture_output=True)
+
+
+def test_fallback_page_is_built_from_storyboard_and_validates(project):
+    from app import tools
+    sb = {"scenes": [{"id": f"s{i}", "title": f"Scene <{i}>", "duration_seconds": 5, "narration": f"s{i}.wav"} for i in range(1, 6)]}
+    tools.write_storyboard(project, sb)
+    (project_dir(project) / "narration").mkdir(exist_ok=True)
+    (project_dir(project) / "narration" / "s1.txt").write_text("Hello there. This is the first scene.")
+    out = tools.build_fallback_page(project)
+    assert out["scenes"] == 5
+    page = (project_dir(project) / "source" / "index.html").read_text()
+    assert page.count("data-scene=") == 5 and "fx.js" in page and "hero3d" in page
+    assert "<5>" not in page and "&lt;5&gt;" in page  # escaped
+    assert "narration" not in json.loads((project_dir(project) / "storyboard.json").read_text())["scenes"][0]
+    assert tools.build_fallback_page(project) is None  # never overwrites the model's page
+    assert tools.validate_project(project, require_renderable=True)["errors"] == []
+
+
+def test_storyboard_is_never_stubbed_in_history():
+    call = {"function": {"name": "write_storyboard", "arguments": json.dumps({"storyboard": {"scenes": [{"id": "a"}]}})}}
+    agent._compact_call(call, {"storyboard": {"scenes": [{"id": "a"}]}}, True)
+    assert "saved" not in call["function"]["arguments"]
+    big = {"function": {"name": "write_source", "arguments": "{}"}}
+    agent._compact_call(big, {"path": "index.html", "content": "x" * 5000}, True)
+    assert "[saved 5000 chars]" in big["function"]["arguments"]

@@ -358,3 +358,26 @@ or `fps: 15` for drafts.
   shrinks old tool output in the history, and retries; later runs start slim. If it still does not fit, the error
   tells you to pick a model with a larger limit (`GROQ_MODEL`, or `GROQ_FALLBACK_MODEL`, which is also tried on 413).
   The long 3D / math / cartoon instructions are only sent when your prompt asks for those styles.
+
+## Video engine and model routing
+
+Videos are no longer written from scratch by the model. The strong model (`GROQ_MODEL`) only emits a
+compact **scene spec** (look, scenes, layout, headline, visual, talking points). The engine
+(`app/scenes.py`, `app/engine.py`) then does the mechanics deterministically:
+
+1. normalizes/validates the spec (limits 3D heroes, fixes unknown values, escapes all text),
+2. downloads free photos for `photo` visuals (Openverse; credits saved to `assets/data/credits.json`),
+3. has the **small model** (`GROQ_SMALL_MODEL`, default `qwen/qwen3-32b`) write the voice-over for every
+   scene in one request (falls back to the core model, then to the scene text),
+4. synthesizes speech, sets each scene as long as its narration needs,
+5. compiles the page from tested components and times every reveal to the narration.
+
+Layouts: `title split chart stat list steps quote compare photo custom` (`custom` = your own HTML/CSS for
+full creative freedom). Visuals: `hero3d bars line donut photo blob icon number`. A typical video is now
+3 core-model calls (`build_video`, `render_video`, done) instead of 15+. Edits use `patch_scene`, which
+rebuilds from the saved `source/spec.json` and only re-voices scenes whose words changed.
+
+Each model has its own rate window and concurrency cap (`LLM_TPM`/`LLM_RPM` for the core model,
+`LLM_TPM_SMALL`/`LLM_RPM_SMALL`/`LLM_CONCURRENCY_SMALL` for the others), so a burst of narration requests
+cannot starve the core model. 3Blue1Brown-style math, hand-written three.js and cartoon requests still use
+the free-form `write_source` workflow.

@@ -337,7 +337,7 @@ def test_agent_shrinks_context_and_retries_after_413(project, monkeypatch):
     monkeypatch.setattr(agent, "OpenAI", Client)
     monkeypatch.setattr(agent, "GROQ_API_KEY", "k")
     events = []
-    out = agent.run_agent(project, "make a video about cats", on_event=events.append)
+    out = agent.run_agent(project, "make a calculus video about cats", on_event=events.append)
     assert out["message"] == "done after shrinking"
     assert len(seen[1]) < len(seen[0])  # the retry used the slim system prompt
     assert any("too large" in e for e in events)
@@ -360,8 +360,11 @@ def test_agent_gives_actionable_error_when_even_the_smallest_request_is_rejected
 def test_long_style_sections_only_when_requested():
     base = agent.build_system("a video about cats")
     assert "__renderFrame" not in base and "Scene()" not in base
-    assert "__renderFrame" in agent.build_system("a 3D solar system")
-    assert len(agent.build_system("cats", slim=True)) < len(base)
+    assert "__renderFrame" in agent.build_system("a three.js solar system")
+    assert "build_video" in base and not agent.is_engine_mode("a calculus lesson")
+    assert {t["function"]["name"] for t in agent._tool_schemas(True)} == agent._ENGINE_TOOLS
+    assert "build_video" not in {t["function"]["name"] for t in agent._tool_schemas(False)}
+    assert len(agent.build_system("calculus", slim=True)) < len(agent.build_system("calculus"))
 
 
 def test_shrink_history_keeps_every_message_and_pairing():

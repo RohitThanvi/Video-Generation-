@@ -30,6 +30,14 @@ LLM_TPM = int(os.getenv("LLM_TPM", "0"))
 LLM_RPM = int(os.getenv("LLM_RPM", "0"))
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
 GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "").strip()
+# Model routing. GROQ_MODEL is the "core" model: it makes the creative decisions (the scene spec).
+# GROQ_SMALL_MODEL does the cheap, high-volume text work (narration scripts, repairs). On Groq the
+# token limits are per model, so splitting work across models multiplies the usable throughput.
+# Leave GROQ_SMALL_MODEL empty to send everything to the core model.
+GROQ_SMALL_MODEL = os.getenv("GROQ_SMALL_MODEL", "qwen/qwen3-32b").strip()
+LLM_TPM_SMALL = int(os.getenv("LLM_TPM_SMALL", "0"))
+LLM_RPM_SMALL = int(os.getenv("LLM_RPM_SMALL", "0"))
+LLM_CONCURRENCY_SMALL = int(os.getenv("LLM_CONCURRENCY_SMALL", "4"))
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 
 # Hard stop for one agent run (seconds). When it is hit, the app finishes the video itself
