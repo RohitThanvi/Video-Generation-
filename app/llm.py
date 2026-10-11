@@ -138,6 +138,8 @@ _slots = threading.BoundedSemaphore(max(1, config.LLM_CONCURRENCY))
 # Models other than the core one (small model, fallback) are limited by the provider separately, so
 # each gets its own window and its own concurrency cap: a burst of narration requests to the small
 # model must never eat the core model's tokens-per-minute.
+# Models the provider said do not exist for this key (404): never tried again in this process.
+_dead_models: set[str] = set()
 _side_lanes: dict[str, tuple[TokenLimiter, threading.BoundedSemaphore]] = {}
 _lanes_lock = threading.Lock()
 _TRANSIENT = (APIConnectionError, APITimeoutError, InternalServerError)
@@ -169,6 +171,8 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
     estimate = estimate_tokens(kwargs.get("messages")) + estimate_tokens(kwargs.get("tools")) + 1500
     last_exc = None
     for model in models:
+        if model in _dead_models and len(models) > 1:
+            continue
         limiter, slots = _lane(model, primary)
         for attempt in range(MAX_RETRIES):
             entry = limiter.acquire(estimate, on_wait)
@@ -202,6 +206,10 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
                 continue
             except APIStatusError as exc:
                 limiter.settle(entry, 0)
+                if getattr(exc, "status_code", None) == 404:
+                    _dead_models.add(model)  # unknown model / no access: use the next one, now and later
+                    last_exc = exc
+                    break
                 if getattr(exc, "status_code", None) == 413:
                     err = _parse_too_large(exc)
                     global learned_limit
@@ -236,16 +244,19 @@ def ask_small(client, system: str, user: str, usage: Usage | None = None, on_wai
     For work a small model does well and that would otherwise burn core tokens: writing narration,
     rephrasing, short repairs. Returns the text with any <think> block removed.
     """
-    last = None
+    errors = []
     for model in dict.fromkeys([small_model(), config.GROQ_MODEL]):
+        if model in _dead_models and model != config.GROQ_MODEL:
+            continue
         try:
             response = complete(
                 client, usage=usage, on_wait=on_wait, model=model, temperature=0.5, max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": "/no_think\n" + user}],
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             )
             text = _THINK.sub("", response.choices[0].message.content or "").strip()
             if text:
                 return text
+            errors.append(f"{model}: empty reply")
         except Exception as exc:  # noqa: BLE001 - any failure of the small model falls through to the next
-            last = exc
-    raise last or RuntimeError("The model returned no text.")
+            errors.append(f"{model}: {str(exc)[:120]}")
+    raise RuntimeError("No model produced text. " + " | ".join(errors))

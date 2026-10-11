@@ -585,6 +585,7 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     bad_calls = 0
     seen_calls: dict[str, int] = {}  # identical (tool, args) repeats
     modified = rendered = False
+    built_now = False
     for turn in range(1, MAX_TURNS + 1):
         if time.monotonic() - started > AGENT_MAX_SECONDS:
             return _finish_ourselves(project_id, emit, f"time limit of {AGENT_MAX_SECONDS}s reached", usage, recent)
@@ -688,6 +689,8 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                 modified, rendered = True, False
             if tool_output["ok"] and name == "render_video":
                 rendered = True
+            if tool_output["ok"] and name in ("build_video", "patch_scene"):
+                built_now = True
             content = _clip(json.dumps(tool_output, default=str))
             # Same call + same arguments again and again = the model is stuck: say so, then stop it.
             key = name + "|" + json.dumps(args, sort_keys=True, default=str)[:600]
@@ -700,6 +703,9 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                 if rendered:
                     return {"status": "completed", "message": "Done.", "usage": usage.as_dict()}
                 return _finish_ourselves(project_id, emit, f"the model repeated {name} without progress", usage, recent)
+        if engine_mode and built_now and not rendered:
+            # The next model turn would only say "render it": skip that (expensive, rate-limited) call.
+            return _finish_ourselves(project_id, emit, "the video is built", usage, recent)
 
     if rendered:
         return {"status": "completed", "message": "Done.", "usage": usage.as_dict()}

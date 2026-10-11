@@ -218,3 +218,39 @@ def test_render_falls_back_when_sandbox_image_is_old(project, monkeypatch):
     out = tools.render(project, 640, 360, 10, on_progress=msgs.append)
     assert len(calls) == 2 and "--budget" not in calls[1] and out["video_url"]
     assert any("out of date" in m for m in msgs)
+
+
+def test_dead_model_is_skipped_and_core_answers(monkeypatch):
+    import httpx
+    from openai import APIStatusError
+    monkeypatch.setattr(llm.config, "GROQ_MODEL", "core")
+    monkeypatch.setattr(llm.config, "GROQ_SMALL_MODEL", "ghost")
+    monkeypatch.setattr(llm, "_dead_models", set())
+    nf = APIStatusError("model does not exist", response=httpx.Response(404, request=httpx.Request("POST", "http://x")), body=None)
+    seen = []
+    assert llm.ask_small(_client([nf, "from core"], seen), "s", "u") == "from core"
+    assert seen == ["ghost", "core"] and "ghost" in llm._dead_models
+    seen.clear()
+    assert llm.ask_small(_client(["again"], seen), "s", "u") == "again" and seen == ["core"]  # never retries ghost
+
+
+def test_engine_agent_renders_right_after_building(project, monkeypatch, fake_sandbox):
+    from app import agent
+    spec = {"scenes": [{"id": "a", "headline": "One"}]}
+    call = SimpleNamespace(id="c1", function=SimpleNamespace(name="build_video", arguments=json.dumps({"spec": spec})))
+    seen = []
+
+    class Client:
+        def __init__(self, **kw):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kw):
+            seen.append(bool(kw.get("tools")))
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[call]))], usage=None)
+    monkeypatch.setattr(agent, "OpenAI", Client)
+    monkeypatch.setattr(agent, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(tools, "generate_narrations", lambda pid, clips: {"clips": []})
+    fake_sandbox.creates = ["renders/final/final.mp4"]
+    out = agent.run_agent(project, "make a video about cats")
+    assert out["status"] == "completed" and "render" in out
+    assert seen.count(True) == 1  # one agent turn: no extra "now render it" turn

@@ -367,7 +367,7 @@ compact **scene spec** (look, scenes, layout, headline, visual, talking points).
 
 1. normalizes/validates the spec (limits 3D heroes, fixes unknown values, escapes all text),
 2. downloads free photos for `photo` visuals (Openverse; credits saved to `assets/data/credits.json`),
-3. has the **small model** (`GROQ_SMALL_MODEL`, default `qwen/qwen3-32b`) write the voice-over for every
+3. has the **small model** (`GROQ_SMALL_MODEL`, default `llama-3.1-8b-instant`) write the voice-over for every
    scene in one request (falls back to the core model, then to the scene text),
 4. synthesizes speech, sets each scene as long as its narration needs,
 5. compiles the page from tested components and times every reveal to the narration.
