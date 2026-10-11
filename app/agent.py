@@ -31,7 +31,7 @@ inside the project workspace using ONLY the provided tools.
 - Keep every file SHORT and never repeat yourself: no duplicated CSS rules, no repeated keyframe percentages, no filler. A complete index.html is typically 120-250 lines.
 
 ## Workflow (follow this order)
-1. install_design_kit  -> creates source/kit.css (design system) and source/kit.js (scene engine). Do NOT rewrite them.
+1. install_design_kit  -> creates source/kit.css + fx.css (design system, motion layer) and source/kit.js + fx.js (scene engine, effects engine). Do NOT rewrite them.
 2. Plan scenes (4-8 scenes). For each scene write narration of ~30-45 words (speech is ~2.8 words/second).
 3. generate_narration for EVERY scene (filename = <scene id>.wav). Each result returns narration_seconds and min_scene_duration_seconds.
 4. write_storyboard: {"scenes":[{"id":"intro","title":"...","duration_seconds":N,"narration":"intro.wav"}, ...]} with duration_seconds >= min_scene_duration_seconds. Scenes without narration: 4-6 s. This is what keeps audio sequential: a clip must fit inside its own scene, so never shorten below the minimum.
@@ -40,7 +40,8 @@ inside the project workspace using ONLY the provided tools.
 
 ## index.html skeleton
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Video</title>
-<link rel="stylesheet" href="kit.css"></head><body>
+<link rel="stylesheet" href="kit.css"><link rel="stylesheet" href="fx.css"></head>
+<body data-theme="sunset" data-bg="aurora" data-post="vignette grain">
 <div class="bg"><i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i></div>
 <section class="scene" data-scene="intro" data-transition="zoom">   <!-- data-scene == storyboard id, one section per scene, same order -->
   <div class="eyebrow fade-in-down">Chapter 01</div>
@@ -49,7 +50,7 @@ inside the project workspace using ONLY the provided tools.
 </section>
 <!-- more <section class="scene" ...> -->
 <div class="progress"></div>
-<script src="kit.js"></script></body></html>
+<script src="kit.js"></script><script src="fx.js"></script></body></html>
 
 ## Design system (classes already defined in kit.css; use them instead of inventing styles)
 - Typography: .eyebrow .title(112px) .h2(76px) .subtitle .body .label .big-number .grad-text (gradient text). Font is Inter/Roboto. Max ~12 words per headline; max 3 text blocks per scene.
@@ -69,6 +70,17 @@ inside the project workspace using ONLY the provided tools.
 - Narration for a scene starts 0.6 s after that scene starts and lasts narration_seconds. Time the reveals to the speech: the first key element at --d ~0.2-0.6s, then spread the remaining --d values evenly across the narration so each item appears as it is mentioned (about 0.35 s before its word). Finish all entrances before the narration ends; the last ~0.8 s of the scene is a calm hold before the cross-fade.
 - Order of elements in time must equal the order they are mentioned in the narration.
 - Never put two scenes' narration in one clip, never reuse a clip name for different scenes.
+
+## Motion-graphics layer (fx.css + fx.js, already loaded by the skeleton): this is what makes it look premium
+ART DIRECTION. The goal is a cinematic motion-graphics video, never a slide deck. Pick ONE look for the whole video from the topic's mood, then make every scene move:
+- <body data-theme="..."> blue (default) | sunset | emerald | crimson | gold | mono.  <body data-bg="..."> particles | network | stars | aurora | grid | waves | rain | none (pick to fit: space=stars, tech/AI=network or rain, retro/energy=grid, nature/calm=aurora or waves, general=particles). data-post="vignette grain leak scan" (vignette is free; grain/leak/scan add ~30% render time each, use grain at most).
+- Every scene needs ONE hero visual, not just text: a 3D object <div class="hero3d" data-shape="torusknot|icosa|globe|crystal|rings" style="--size:640px"></div> (real three.js, put it in a .row next to the text; keep at most one per scene, and no more than 2-3 scenes with one), or a chart, or an inline-SVG illustration, or a giant number. Never a scene with only a headline and a paragraph.
+- Kinetic typography: <h1 class="title" data-split="chars|words" data-kin="rise|drop|blur|flip|wave|zoom|spin|glitch" style="--d:.3s;--step:.06s">. Use it for the main headline of EVERY scene (chars for short titles, words for longer). Variants: class="neon", "fx-gradient" (flowing gradient), "stroke-text", "glitch" (+ data-text="same text"), "underline-draw", .mask-reveal > h2 (slides up from a mask).
+- Camera: every scene already gets a slow push/pull/pan (data-cam="push|pull|left|right|drift|tilt|none" to choose). Transitions: data-transition="zoom|slide|wipe|curtain|slice|flip|blur|spin|rise|glitch" (vary them, never repeat the same one twice in a row).
+- Infographics (they animate in by themselves, give them real numbers from the topic): <div class="fx-bars" data-values="24,46,71" data-labels="A,B,C" data-suffix="k" style="--h:480px;width:760px"></div>, <div class="fx-donut" data-value="87" data-suffix="%" data-label="Label" style="--size:380px"></div>, <div class="fx-line" data-values="2,3,5,4,9" style="--w:700px;--h:360px;width:700px;height:360px"></div>.
+- Ambient motion on shapes/icons/cards: .bob .breathe .spin-slow .spin-rev .tilt3d .glow .shine .ring-burst .blob (morphing gradient blob), .orbit (children orbit; set --size), .marquee (giant scrolling outline text as a backdrop), .lower-third (name tag), photos: <div class="photo"><img class="kb" src="../assets/images/x.jpg"></div> (Ken Burns pan/zoom).
+- Rhythm: alternate big/quiet scenes; open with the most striking visual in the first 2 seconds; end on a bold closing card. Use at least 3 different entrance classes, 3 different transitions and 2 different hero visuals per video. Time reveals to the narration as described below.
+- Performance: each frame is rendered by software; keep to <= 1 hero3d per scene, avoid huge blurs/box-shadows and more than ~25 animated elements per scene.
 
 ## Other styles: choose from the user's request (the kit above is the default)
 - 3D (3D, WebGL, three.js, spinning object, planet, camera orbit): do NOT use the kit. One <script type="module"> with `import * as THREE from 'three'`. Create `new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true})`, setPixelRatio(1), setSize(innerWidth, innerHeight); build geometry procedurally (no remote models). Drive everything from time only: `window.__renderFrame = (tMs) => { update(tMs/1000); renderer.render(scene, camera); }; window.__renderFrame(0);`. Titles: HTML overlay (position:fixed) with CSS animations.

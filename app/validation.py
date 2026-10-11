@@ -21,6 +21,8 @@ NARRATION_LEAD_SECONDS = 0.6
 NARRATION_TAIL_SECONDS = 0.8
 
 
+HERO_MARKERS = ("hero3d", "fx-bars", "fx-donut", "fx-line", "<svg", "<img", "<canvas", "big-number", "data-count", "blob", "orbit", "marquee", "timeline", "photo")
+
 def wav_seconds(path: Path) -> float | None:
     try:
         with wave.open(str(path), "rb") as w:
@@ -168,3 +170,17 @@ def _check_scene_markup(root: Path, scenes: list, errors: list, warnings: list) 
         )
     if extra:
         errors.append("index.html has data-scene ids that are not in the storyboard: " + ", ".join(extra))
+    # Look-and-feel checks are warnings: the agent is told to fix them, the render still works.
+    if "fx.js" not in html or "fx.css" not in html:
+        warnings.append(
+            "index.html does not load fx.css/fx.js (motion layer: animated background, kinetic text, "
+            "3D hero objects, charts, camera moves). Link them as in the skeleton."
+        )
+    for sid, body in re.findall(
+        r"""<section[^>]*data-scene\s*=\s*["']([^"']+)["'][^>]*>(.*?)</section>""", html, re.S | re.I
+    ):
+        if not any(marker in body for marker in HERO_MARKERS):
+            warnings.append(
+                f"Scene '{sid}' is text only. Add a hero visual (hero3d, fx-bars/fx-donut/fx-line, an "
+                "inline <svg>, a big-number, .blob/.orbit, or a photo) so it does not look like a slide."
+            )

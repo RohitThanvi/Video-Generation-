@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
@@ -432,7 +433,9 @@ def test_install_design_kit_copies_css_and_engine(project):
     root = project_dir(project) / "source"
     assert (root / "kit.css").read_text().count(".fade-in-up") > 0
     assert "__VIDEO_SCENES__" in (root / "kit.js").read_text()
-    assert result["files"] == ["source/kit.css", "source/kit.js"]
+    assert result["files"] == ["source/kit.css", "source/fx.css", "source/kit.js", "source/fx.js"]
+    assert "data-split" in (root / "fx.js").read_text() and ".hero3d" in (root / "fx.css").read_text()
+    assert "fx.js" in result["html_end_of_body"] and "fx.css" in result["html_head"]
 
 
 def test_validation_rejects_narration_longer_than_its_scene(project):
@@ -489,3 +492,29 @@ def test_agent_prompt_says_bundled_libraries_need_no_upload():
     prompt = agent.SYSTEM
     assert "import * as THREE from 'three'" in prompt
     assert "never ask the user to upload" in prompt
+
+
+def test_validation_warns_about_text_only_scenes_and_missing_fx(project):
+    from app import validation
+
+    root = project_dir(project)
+    (root / "storyboard.json").write_text(json.dumps({"scenes": [
+        {"id": "a", "duration_seconds": 4}, {"id": "b", "duration_seconds": 4}]}))
+    (root / "source" / "index.html").write_text(
+        '<link href="kit.css"><section class="scene" data-scene="a"><h1>Only text</h1></section>'
+        '<section class="scene" data-scene="b"><div class="hero3d"></div></section><script src="kit.js"></script>'
+    )
+    warnings = " | ".join(validation.validate_project(project)["warnings"])
+    assert "fx.css/fx.js" in warnings
+    assert "Scene 'a' is text only" in warnings and "Scene 'b'" not in warnings
+
+
+def test_fx_engine_is_syntactically_valid_javascript(tmp_path):
+    import shutil
+    import subprocess
+
+    if not shutil.which("node"):
+        pytest.skip("node is required")
+    kit = Path(tools.__file__).parent / "kit"
+    for name in ("fx.js", "kit.js"):
+        subprocess.run(["node", "--check", str(kit / name)], check=True, capture_output=True)

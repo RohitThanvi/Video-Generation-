@@ -33,7 +33,7 @@ CATEGORY_EXTENSIONS = {
 NARRATION_TEXT_EXTENSIONS = {".txt"}
 
 KIT_DIR = Path(__file__).resolve().parent / "kit"
-KIT_FILES = ("kit.css", "kit.js")
+KIT_FILES = ("kit.css", "fx.css", "kit.js", "fx.js")
 
 # generate_narrations runs clips in parallel; manifest read-modify-write must not interleave.
 _MANIFEST_LOCK = threading.Lock()
@@ -113,8 +113,8 @@ def install_design_kit(project_id: str):
         shutil.copyfile(KIT_DIR / name, target / name)
     return {
         "files": [f"source/{n}" for n in KIT_FILES],
-        "html_head": '<link rel="stylesheet" href="kit.css">',
-        "html_end_of_body": '<script src="kit.js"></script>',
+        "html_head": '<link rel="stylesheet" href="kit.css"><link rel="stylesheet" href="fx.css">',
+        "html_end_of_body": '<script src="kit.js"></script><script src="fx.js"></script>',
         "note": "Use the kit classes from the system prompt. Do not re-implement the engine or the CSS.",
     }
 

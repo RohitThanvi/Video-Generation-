@@ -1,0 +1,6 @@
+{"scenes":[
+ {"id":"hero","title":"Hero","duration_seconds":6},
+ {"id":"orbit3d","title":"3D","duration_seconds":6},
+ {"id":"numbers","title":"Numbers","duration_seconds":7},
+ {"id":"finale","title":"Finale","duration_seconds":5}
+]}

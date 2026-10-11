@@ -1,0 +1,137 @@
+/* Design kit for the HTML video compiler. 1920x1080 canvas. Installed as source/kit.css.
+   Everything animates only while its scene has .is-active (the engine in kit.js sets it). */
+:root{
+  --bg-0:#060913; --bg-1:#0b1226; --bg-2:#131c3a;
+  --ink:#f4f7ff; --ink-dim:rgba(226,232,255,.72); --ink-faint:rgba(226,232,255,.45);
+  --accent:#6ea8ff; --accent-2:#a78bfa; --accent-3:#2dd4bf; --warn:#fbbf24; --bad:#fb7185; --good:#34d399;
+  --glass-bg:linear-gradient(145deg,rgba(255,255,255,.12),rgba(255,255,255,.04));
+  --glass-line:rgba(255,255,255,.16);
+  --shadow:0 30px 80px -20px rgba(0,0,0,.65),0 8px 24px -8px rgba(0,0,0,.45);
+  --ease:cubic-bezier(.22,1,.36,1);          /* smooth out-expo-ish */
+  --ease-io:cubic-bezier(.65,0,.35,1);
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);
+  --t:.8s;                                    /* scene transition length (keep == Kit.TRANSITION) */
+  --font:"Inter","Roboto","Helvetica Neue","DejaVu Sans","Noto Sans",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg-0);color:var(--ink);
+  font-family:var(--font);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+
+/* ---------- animated background ---------- */
+.bg{position:fixed;inset:0;z-index:0;overflow:hidden;
+  background:
+   radial-gradient(1200px 800px at 15% 10%,rgba(110,168,255,.22),transparent 60%),
+   radial-gradient(1000px 700px at 90% 85%,rgba(167,139,250,.24),transparent 60%),
+   radial-gradient(900px 600px at 60% 40%,rgba(45,212,191,.10),transparent 65%),
+   linear-gradient(160deg,var(--bg-2),var(--bg-1) 45%,var(--bg-0))}
+.bg .orb{position:absolute;border-radius:50%;will-change:transform;animation:drift 22s var(--ease-io) infinite alternate}
+.bg .o1{width:1100px;height:1100px;left:-380px;top:-380px;background:radial-gradient(closest-side,rgba(59,130,246,.55),rgba(59,130,246,0))}
+.bg .o2{width:1000px;height:1000px;right:-340px;bottom:-380px;background:radial-gradient(closest-side,rgba(139,92,246,.5),rgba(139,92,246,0));animation-duration:27s}
+.bg .o3{width:760px;height:760px;left:44%;top:22%;background:radial-gradient(closest-side,rgba(20,184,166,.28),rgba(20,184,166,0));animation-duration:31s}
+.bg::after{content:"";position:absolute;inset:0;
+  background-image:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1.2px);background-size:46px 46px;
+  mask-image:radial-gradient(ellipse at center,#000 30%,transparent 75%)}
+@keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(120px,80px,0) scale(1.12)}}
+
+/* ---------- scenes + transitions ---------- */
+.scene{position:absolute;inset:0;z-index:1;display:flex;flex-direction:column;justify-content:center;gap:26px;
+  padding:110px 140px;visibility:hidden;opacity:0}
+.scene.is-active{visibility:visible;opacity:1;animation:scene-in var(--t) var(--ease) both}
+.scene.is-leaving{animation:scene-out var(--t) var(--ease-io) both}
+/* default = crossfade with a tiny scale; override with data-transition="slide|zoom|wipe" */
+@keyframes scene-in{from{opacity:0;transform:scale(1.025)}to{opacity:1;transform:none}}
+@keyframes scene-out{from{opacity:1;transform:none}to{opacity:0;transform:scale(.985)}}
+.scene[data-transition=slide].is-active{animation-name:slide-in}
+.scene[data-transition=slide].is-leaving{animation-name:slide-out}
+@keyframes slide-in{from{opacity:0;transform:translateX(160px)}to{opacity:1;transform:none}}
+@keyframes slide-out{from{opacity:1;transform:none}to{opacity:0;transform:translateX(-160px)}}
+.scene[data-transition=zoom].is-active{animation-name:zoom-in}
+.scene[data-transition=zoom].is-leaving{animation-name:zoom-out}
+@keyframes zoom-in{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:none}}
+@keyframes zoom-out{from{opacity:1;transform:none}to{opacity:0;transform:scale(1.12)}}
+.scene[data-transition=wipe].is-active{animation-name:wipe-in}
+.scene[data-transition=wipe].is-leaving{animation-name:wipe-out}
+@keyframes wipe-in{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}
+@keyframes wipe-out{from{opacity:1}to{opacity:0}}
+
+/* ---------- entrance animations (use on EVERY element; --d sets the delay) ---------- */
+.fade-in,.fade-in-up,.fade-in-down,.slide-in-left,.slide-in-right,.scale-up,.blur-in,.pop,.draw,.grow-x,.grow-y{opacity:0}
+.is-active .fade-in      {animation:a-fade   .9s var(--ease) var(--d,0s) both}
+.is-active .fade-in-up   {animation:a-up     1s  var(--ease) var(--d,0s) both}
+.is-active .fade-in-down {animation:a-down   1s  var(--ease) var(--d,0s) both}
+.is-active .slide-in-left{animation:a-left   1s  var(--ease) var(--d,0s) both}
+.is-active .slide-in-right{animation:a-right 1s  var(--ease) var(--d,0s) both}
+.is-active .scale-up     {animation:a-scale  .9s var(--ease-spring) var(--d,0s) both}
+.is-active .blur-in      {animation:a-blur   1.1s var(--ease) var(--d,0s) both}
+.is-active .pop          {animation:a-pop    .7s var(--ease-spring) var(--d,0s) both}
+.is-active .grow-x       {transform-origin:left center;animation:a-growx 1.2s var(--ease) var(--d,0s) both}
+.is-active .grow-y       {transform-origin:center bottom;animation:a-growy 1.2s var(--ease) var(--d,0s) both}
+.is-active .draw         {opacity:1;stroke-dasharray:1;stroke-dashoffset:1;animation:a-draw 1.6s var(--ease-io) var(--d,0s) forwards}
+@keyframes a-fade{from{opacity:0}to{opacity:1}}
+@keyframes a-up{from{opacity:0;transform:translateY(48px)}to{opacity:1;transform:none}}
+@keyframes a-down{from{opacity:0;transform:translateY(-48px)}to{opacity:1;transform:none}}
+@keyframes a-left{from{opacity:0;transform:translateX(-120px)}to{opacity:1;transform:none}}
+@keyframes a-right{from{opacity:0;transform:translateX(120px)}to{opacity:1;transform:none}}
+@keyframes a-scale{from{opacity:0;transform:scale(.7)}to{opacity:1;transform:none}}
+@keyframes a-blur{from{opacity:0;filter:blur(12px);transform:scale(1.05)}to{opacity:1;filter:none;transform:none}}
+@keyframes a-pop{0%{opacity:0;transform:scale(.4)}100%{opacity:1;transform:none}}
+@keyframes a-growx{from{opacity:1;transform:scaleX(0)}to{opacity:1;transform:scaleX(1)}}
+@keyframes a-growy{from{opacity:1;transform:scaleY(0)}to{opacity:1;transform:scaleY(1)}}
+@keyframes a-draw{to{stroke-dashoffset:0}}   /* SVG path needs pathLength="1" */
+/* children of .stagger animate one after another (set the animation class on each child) */
+.stagger>*:nth-child(1){--d:calc(var(--base,0s) + .00s)} .stagger>*:nth-child(2){--d:calc(var(--base,0s) + .14s)}
+.stagger>*:nth-child(3){--d:calc(var(--base,0s) + .28s)} .stagger>*:nth-child(4){--d:calc(var(--base,0s) + .42s)}
+.stagger>*:nth-child(5){--d:calc(var(--base,0s) + .56s)} .stagger>*:nth-child(6){--d:calc(var(--base,0s) + .70s)}
+.stagger>*:nth-child(7){--d:calc(var(--base,0s) + .84s)} .stagger>*:nth-child(8){--d:calc(var(--base,0s) + .98s)}
+/* continuous ambient motion (after the entrance finishes) */
+.float{animation:float 6s var(--ease-io) infinite alternate}
+.pulse{animation:pulse 2.4s var(--ease-io) infinite}
+@keyframes float{from{translate:0 -10px}to{translate:0 12px}}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(110,168,255,.45)}60%{box-shadow:0 0 0 28px rgba(110,168,255,0)}}
+
+/* ---------- typography ---------- */
+.eyebrow{display:inline-flex;align-items:center;gap:14px;font-size:26px;font-weight:600;letter-spacing:.22em;
+  text-transform:uppercase;color:var(--accent)}
+.eyebrow::before{content:"";width:56px;height:3px;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+.title{font-size:112px;line-height:1.02;font-weight:800;letter-spacing:-.035em}
+.h2{font-size:76px;line-height:1.06;font-weight:750;letter-spacing:-.028em}
+.subtitle{font-size:38px;line-height:1.4;font-weight:400;color:var(--ink-dim);max-width:1100px}
+.body{font-size:32px;line-height:1.45;color:var(--ink-dim)}
+.grad-text{background:linear-gradient(100deg,#9cc4ff,#c4b5fd 55%,#5eead4);-webkit-background-clip:text;background-clip:text;color:transparent}
+.big-number{font-size:150px;font-weight:800;letter-spacing:-.04em;line-height:1;font-variant-numeric:tabular-nums}
+.label{font-size:26px;font-weight:500;color:var(--ink-faint);letter-spacing:.04em}
+
+/* ---------- layout helpers ---------- */
+.row{display:flex;align-items:center;gap:60px}.col{display:flex;flex-direction:column;gap:28px}
+.grow{flex:1}.center{align-items:center;text-align:center;justify-content:center}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:40px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:36px}
+.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:30px}
+
+/* ---------- glassmorphism cards ---------- */
+.glass{position:relative;background:var(--glass-bg);border:1px solid var(--glass-line);border-radius:36px;
+  padding:44px;box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.22);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+.glass h3{font-size:40px;font-weight:700;letter-spacing:-.015em;margin:22px 0 10px}
+.glass p{font-size:28px;line-height:1.45;color:var(--ink-dim)}
+.chip{display:inline-flex;align-items:center;gap:12px;padding:12px 26px;border-radius:999px;font-size:26px;font-weight:600;
+  background:rgba(110,168,255,.14);border:1px solid rgba(110,168,255,.35);color:#cfe0ff}
+.icon-badge{width:104px;height:104px;border-radius:30px;display:grid;place-items:center;color:#fff;
+  background:linear-gradient(145deg,var(--accent),var(--accent-2));box-shadow:0 18px 40px -10px rgba(110,168,255,.55),inset 0 1px 0 rgba(255,255,255,.4)}
+.icon-badge svg{width:56px;height:56px}
+.icon-badge.teal{background:linear-gradient(145deg,#2dd4bf,#3b82f6)}.icon-badge.amber{background:linear-gradient(145deg,#fbbf24,#fb7185)}
+.divider{height:2px;width:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.28),transparent)}
+.bar{height:22px;border-radius:12px;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+.timeline{position:relative;display:flex;justify-content:space-between;align-items:flex-start}
+.timeline::before{content:"";position:absolute;left:0;right:0;top:34px;height:4px;border-radius:4px;background:rgba(255,255,255,.14)}
+.timeline .node{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;max-width:300px}
+.timeline .dot{width:68px;height:68px;border-radius:50%;background:linear-gradient(145deg,var(--accent),var(--accent-2));
+  border:6px solid var(--bg-1);box-shadow:0 0 0 2px var(--accent)}
+
+/* ---------- global progress bar ---------- */
+.progress{position:fixed;left:0;bottom:0;height:6px;width:100%;z-index:5;transform-origin:left;transform:scaleX(0);
+  background:linear-gradient(90deg,var(--accent),var(--accent-2),var(--accent-3))}
+svg{overflow:visible}
+/* so scale/rotate animations on SVG children pivot around their own centre */
+svg [class]{transform-box:fill-box;transform-origin:center}
+svg .spin{transform-box:view-box;transform-origin:50% 50%}

@@ -325,3 +325,23 @@ type must match the asset category. Disable with `ALLOW_WEB_ASSETS=false`.
   turns (they used to be re-sent on every call); `patch_source` / `read_source` let it fix a bug
   without rewriting a whole page; `generate_narrations` makes all clips in one call, in parallel.
 - Each agent result includes `usage` (calls, prompt/completion tokens, retries, seconds waited).
+
+## Motion-graphics layer (cinematic look)
+
+The default design kit now ships `fx.css` + `fx.js` next to `kit.css`/`kit.js` (installed by
+`install_design_kit`, and the agent is told to art-direct with it):
+
+- **Backgrounds** `data-bg`: particles, network, stars (warp), aurora, grid (synthwave), waves, rain; **themes** `data-theme`: sunset, emerald, crimson, gold, mono.
+- **Kinetic typography** `data-split="chars|words"` + `data-kin` (rise, drop, blur, flip, wave, zoom, spin, glitch), neon / gradient / glitch / stroke text.
+- **Camera moves** per scene and **10 transitions** (curtain, slice, flip, blur, spin, rise, glitch, ...).
+- **Real 3D hero objects** (`.hero3d`, three.js, matcap-shaded so they stay cheap), **animated charts** (`.fx-bars`, `.fx-donut`, `.fx-line`), orbits, morphing blobs, marquee, Ken Burns photos, film grain/vignette.
+- `validate_project` warns when a scene is text only or when `fx.js` is not linked.
+
+Everything is a function of the virtual clock plus a seeded random generator, so renders are exactly
+repeatable. Try it: `python scripts/cli.py example kinetic-showreel`.
+
+Render cost: heavy effects are drawn into single canvases and WebGL objects exist only while their scene is on
+screen, because every live WebGL context or full-screen blend layer makes each frame several seconds slower on
+CPU-only rendering. Measured on a 2-core VM at 1920x1080: about 1.2 s per frame for the showreel (a 24 s
+video at 30 fps is roughly 15 minutes there; give the sandbox more CPUs and it scales down). Use `fps: 24`
+or `fps: 15` for drafts.
