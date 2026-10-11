@@ -254,3 +254,87 @@ def test_engine_agent_renders_right_after_building(project, monkeypatch, fake_sa
     out = agent.run_agent(project, "make a video about cats")
     assert out["status"] == "completed" and "render" in out
     assert seen.count(True) == 1  # one agent turn: no extra "now render it" turn
+
+
+def _rl(msg="Rate limit reached. Please try again in 30s."):
+    import httpx
+    from openai import RateLimitError
+    return RateLimitError(msg, response=httpx.Response(429, request=httpx.Request("POST", "http://x")), body=None)
+
+
+def _keyed_client(behaviour, log):
+    def factory(key):
+        def create(**kw):
+            log.append(key)
+            r = behaviour(key)
+            if isinstance(r, Exception):
+                raise r
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=r))], usage=None)
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    return factory
+
+
+@pytest.fixture
+def clean_lanes(monkeypatch):
+    monkeypatch.setattr(llm, "_limiter", llm.TokenLimiter())
+    monkeypatch.setattr(llm, "_side_lanes", {})
+    monkeypatch.setattr(llm, "_pools", {})
+    monkeypatch.setattr(llm, "_dead_models", set())
+    monkeypatch.setattr(llm.config, "GROQ_MODEL", "core")
+
+
+def test_rate_limited_key_fails_over_without_sleeping(clean_lanes):
+    log, slept = [], []
+    pool = llm.ClientPool(["k1", "k2"], _keyed_client(lambda k: _rl() if k == "k1" else "ok", log))
+    usage, msgs = llm.Usage(), []
+    for _ in range(3):
+        r = llm.complete(pool, usage=usage, sleep=slept.append, on_wait=msgs.append, model="core", messages=[{"role": "user", "content": "x"}])
+        assert r.choices[0].message.content == "ok"
+    assert slept == [] and usage.key_switches >= 1 and usage.retries == 0
+    assert log.count("k1") == 1  # tried once, then cooled down and skipped
+    assert any("switching to another key" in m for m in msgs)
+
+
+def test_all_keys_limited_waits_for_the_first_to_recover(clean_lanes):
+    log, slept = [], []
+    state = {"n": 0}
+
+    def behaviour(k):
+        state["n"] += 1
+        return _rl("try again in 7s") if state["n"] <= 2 else "ok"
+    pool = llm.ClientPool(["k1", "k2"], _keyed_client(behaviour, log))
+    r = llm.complete(pool, sleep=slept.append, model="core", messages=[{"role": "user", "content": "x"}])
+    assert r.choices[0].message.content == "ok" and slept and 6 < slept[0] < 9
+
+
+def test_concurrent_calls_are_spread_over_keys(clean_lanes):
+    pool = llm.ClientPool(["a", "b", "c"], lambda k: object())
+    first, second = pool.acquire("core")[0], pool.acquire("core")[0]
+    third = pool.acquire("core")[0]
+    assert {first, second, third} == {0, 1, 2}
+
+
+def test_cooldown_is_per_model_and_pool_is_shared(clean_lanes):
+    pool = llm.get_pool(["a", "b"], lambda k: object())
+    assert llm.get_pool(["a", "b"], lambda k: object()) is pool
+    pool.cool(0, "core", 100)
+    assert pool.acquire("core")[0] == 1 and pool.acquire("small")[0] in (0, 1)
+    assert llm._lane("core", "core", 0)[0] is llm._limiter and llm._lane("core", "core", 1)[0] is not llm._limiter
+
+
+def test_agent_uses_every_configured_key(project, monkeypatch):
+    from app import agent
+    created = []
+
+    class Client:
+        def __init__(self, api_key=None, **kw):
+            created.append(api_key)
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **k: SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="done", tool_calls=None))], usage=None)))
+    monkeypatch.setattr(agent, "OpenAI", Client)
+    monkeypatch.setattr(agent, "GROQ_API_KEY", "k1")
+    monkeypatch.setattr(agent, "GROQ_API_KEYS", ["k2", "k1", "k3"])
+    monkeypatch.setattr(llm, "_pools", {})
+    events = []
+    agent.run_agent(project, "make a video about cats", on_event=events.append)
+    assert any("Using 3 API keys" in e for e in events)

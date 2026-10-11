@@ -3,7 +3,7 @@ import json
 import re
 import time
 from . import llm
-from .config import GROQ_API_KEY, GROQ_MODEL, LLM_TIMEOUT_SECONDS, AGENT_MAX_SECONDS
+from .config import GROQ_API_KEY, GROQ_API_KEYS, GROQ_MODEL, LLM_TIMEOUT_SECONDS, AGENT_MAX_SECONDS
 from .project import project_dir, load_project, list_files
 from .validation import validate_project
 from .web_assets import search_free_images, download_asset
@@ -545,16 +545,19 @@ def _finish_ourselves(project_id: str, emit, reason: str, usage, recent: list, f
 
 def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     """Drive the model until the video is built. `on_event(str)` receives live progress lines."""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not configured.")
+    keys = list(dict.fromkeys(k for k in [GROQ_API_KEY, *GROQ_API_KEYS] if k))
+    if not keys:
+        raise RuntimeError("GROQ_API_KEY (or GROQ_API_KEYS) is not configured.")
     emit = on_event or (lambda message: None)
 
-    client = OpenAI(
-        api_key=GROQ_API_KEY,
+    client = llm.get_pool(keys, lambda key: OpenAI(
+        api_key=key,
         base_url="https://api.groq.com/openai/v1",
         timeout=LLM_TIMEOUT_SECONDS,
         max_retries=0,  # llm.complete owns retry/backoff so the shared budget stays accurate
-    )
+    ))
+    if len(keys) > 1:
+        emit(f"Using {len(keys)} API keys.")
 
     manifest = load_project(project_id)
     files = list_files(project_id)

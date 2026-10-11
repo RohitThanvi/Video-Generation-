@@ -119,6 +119,7 @@ class Usage:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.retries = 0
+        self.key_switches = 0
         self.waited_seconds = 0.0
         self.models: set[str] = set()
 
@@ -128,6 +129,7 @@ class Usage:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "rate_limit_retries": self.retries,
+            "key_switches": self.key_switches,
             "waited_seconds": round(self.waited_seconds, 1),
             "models": sorted(self.models),
         }
@@ -149,21 +151,114 @@ def get_limiter() -> TokenLimiter:
     return _limiter
 
 
-def _lane(model: str, primary: str):
-    """(limiter, semaphore) for `model`; the request's primary model uses the shared core lane."""
-    if model == config.GROQ_MODEL or (model == primary and model != config.GROQ_SMALL_MODEL):
+def _new_lane(model: str):
+    if model == config.GROQ_MODEL:
+        return TokenLimiter(config.LLM_TPM, config.LLM_RPM), threading.BoundedSemaphore(max(1, config.LLM_CONCURRENCY))
+    return (TokenLimiter(config.LLM_TPM_SMALL, config.LLM_RPM_SMALL),
+            threading.BoundedSemaphore(max(1, config.LLM_CONCURRENCY_SMALL)))
+
+
+def _lane(model: str, primary: str, key: int = 0):
+    """(limiter, semaphore) for `model` on API key number `key`.
+
+    The first key's core model uses the shared core lane. Every other (key, model) pair gets its own
+    window and concurrency cap, because the provider meters each key and each model separately.
+    """
+    if key == 0 and (model == config.GROQ_MODEL or (model == primary and model != config.GROQ_SMALL_MODEL)):
         return _limiter, _slots
+    name = f"{key}:{model}"
     with _lanes_lock:
-        if model not in _side_lanes:
-            _side_lanes[model] = (
-                TokenLimiter(config.LLM_TPM_SMALL, config.LLM_RPM_SMALL),
-                threading.BoundedSemaphore(max(1, config.LLM_CONCURRENCY_SMALL)),
-            )
-        return _side_lanes[model]
+        if name not in _side_lanes:
+            _side_lanes[name] = _new_lane(model)
+        return _side_lanes[name]
+
+
+class ClientPool:
+    """Several API keys behind one client: spread load over them and fail over when one is rate limited.
+
+    Note: Groq meters limits per organization, so the keys must come from different accounts/orgs
+    to add capacity. Cooldowns are tracked per (key, model) because limits are per model too.
+    """
+
+    def __init__(self, keys, factory=None, clock=time.monotonic):
+        self.keys = list(dict.fromkeys(k for k in keys if k)) or [None]
+        self._factory = factory
+        self._clients: dict[int, object] = {}
+        self._cool: dict[tuple[int, str], float] = {}
+        self._busy = [0] * len(self.keys)
+        self._used = [0.0] * len(self.keys)
+        self._lock = threading.Lock()
+        self._clock = clock
+
+    @classmethod
+    def single(cls, client):
+        pool = cls([None])
+        pool._clients[0] = client
+        return pool
+
+    @property
+    def size(self) -> int:
+        return len(self.keys)
+
+    def _client(self, i: int):
+        if i not in self._clients:
+            self._clients[i] = self._factory(self.keys[i])
+        return self._clients[i]
+
+    def acquire(self, model: str):
+        """(index, client, seconds_to_wait): the least busy key that is not cooling down for `model`;
+        when every key is cooling, the one that frees up first plus how long to wait for it."""
+        with self._lock:
+            now = self._clock()
+            ready = [i for i in range(self.size) if self._cool.get((i, model), 0) <= now]
+            if ready:
+                i, wait = min(ready, key=lambda k: (self._busy[k], self._used[k])), 0.0
+            else:
+                i = min(range(self.size), key=lambda k: self._cool[(k, model)])
+                wait = self._cool[(i, model)] - now
+            self._busy[i] += 1
+            self._used[i] = now
+        return i, self._client(i), max(0.0, wait)
+
+    def release(self, i: int):
+        with self._lock:
+            self._busy[i] = max(0, self._busy[i] - 1)
+
+    def cool(self, i: int, model: str, seconds: float):
+        with self._lock:
+            self._cool[(i, model)] = self._clock() + seconds
+
+    def has_alternative(self, i: int, model: str) -> bool:
+        now = self._clock()
+        with self._lock:
+            return any(k != i and self._cool.get((k, model), 0) <= now for k in range(self.size))
+
+    def status(self) -> list[dict]:
+        now = self._clock()
+        with self._lock:
+            return [{"key": f"#{i + 1}", "busy": self._busy[i],
+                     "cooling": sorted({m for (k, m), t in self._cool.items() if k == i and t > now})}
+                    for i in range(self.size)]
+
+
+_pools: dict[tuple, "ClientPool"] = {}
+
+
+def get_pool(keys, factory) -> "ClientPool":
+    """One shared pool per key set, so concurrent jobs see each other's cooldowns and load."""
+    ident = tuple(dict.fromkeys(k for k in keys if k))
+    with _lanes_lock:
+        pool = _pools.get(ident)
+        if pool is None:
+            pool = _pools[ident] = ClientPool(ident)
+        pool._factory = factory
+        pool._clients.clear()  # clients are cheap; state (cooldowns, load) is what must be shared
+    return pool
 
 
 def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None, **kwargs):
-    """chat.completions.create with budgeting, retry and model fallback."""
+    """chat.completions.create with budgeting, key rotation, retry and model fallback."""
+    pool = client if isinstance(client, ClientPool) else ClientPool.single(client)
     models = [kwargs.pop("model")]
     primary = models[0]
     if config.GROQ_FALLBACK_MODEL and config.GROQ_FALLBACK_MODEL not in models:
@@ -173,51 +268,73 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None,
     for model in models:
         if model in _dead_models and len(models) > 1:
             continue
-        limiter, slots = _lane(model, primary)
-        for attempt in range(MAX_RETRIES):
-            entry = limiter.acquire(estimate, on_wait)
+        attempts = MAX_RETRIES * pool.size
+        for attempt in range(attempts):
+            idx, cl, cooling = pool.acquire(model)
+            if cooling > 0:  # every key is rate limited for this model: wait for the first to recover
+                pool.release(idx)
+                if on_wait:
+                    on_wait(f"All {pool.size} API key(s) are rate limited; waiting {round(cooling + 0.5)}s…")
+                if usage:
+                    usage.waited_seconds += cooling + 0.5
+                sleep(cooling + 0.5)
+                idx, cl, _ = pool.acquire(model)
+            limiter, slots = _lane(model, primary, idx)
             try:
-                with slots:
-                    response = client.chat.completions.create(model=model, **kwargs)
-            except RateLimitError as exc:
-                limiter.settle(entry, 0)
-                last_exc = exc
-                delay = retry_after_seconds(exc)
-                if delay is None:
-                    delay = min(2 ** attempt * 5, 60)
-                limiter.penalize(delay)
-                if usage:
-                    usage.retries += 1
-                    usage.waited_seconds += delay + 0.5
-                if attempt < MAX_RETRIES - 1:
-                    if on_wait:
-                        on_wait(f"Rate limited by the API; waiting {round(delay + 0.5)}s before retrying…")
-                    sleep(delay + 0.5)
-                continue
-            except _TRANSIENT as exc:
-                limiter.settle(entry, 0)
-                last_exc = exc
-                delay = min(2 ** attempt, 20)
-                if usage:
-                    usage.retries += 1
-                    usage.waited_seconds += delay
-                if attempt < MAX_RETRIES - 1:
-                    sleep(delay)
-                continue
-            except APIStatusError as exc:
-                limiter.settle(entry, 0)
-                if getattr(exc, "status_code", None) == 404:
-                    _dead_models.add(model)  # unknown model / no access: use the next one, now and later
+                entry = limiter.acquire(estimate, on_wait)
+                try:
+                    with slots:
+                        response = cl.chat.completions.create(model=model, **kwargs)
+                except RateLimitError as exc:
+                    limiter.settle(entry, 0)
                     last_exc = exc
-                    break
-                if getattr(exc, "status_code", None) == 413:
-                    err = _parse_too_large(exc)
-                    global learned_limit
-                    if err.limit:
-                        learned_limit = err.limit if learned_limit is None else min(learned_limit, err.limit)
-                    last_exc = err
-                    break  # a retry cannot help; try the fallback model if there is one
-                raise
+                    delay = retry_after_seconds(exc)
+                    if delay is None:
+                        delay = min(2 ** (attempt // pool.size) * 5, 60)
+                    limiter.penalize(delay)
+                    pool.cool(idx, model, delay + 0.5)
+                    if pool.has_alternative(idx, model):
+                        # Another key is free: switch immediately instead of waiting.
+                        if usage:
+                            usage.key_switches += 1
+                        if on_wait:
+                            on_wait(f"API key #{idx + 1} is rate limited; switching to another key.")
+                        continue
+                    if usage:
+                        usage.retries += 1
+                        usage.waited_seconds += delay + 0.5
+                    if attempt < attempts - 1:
+                        if on_wait:
+                            on_wait(f"Rate limited by the API; waiting {round(delay + 0.5)}s before retrying…")
+                        sleep(delay + 0.5)
+                    pool.cool(idx, model, 0)  # we waited it out here; do not wait again in acquire()
+                    continue
+                except _TRANSIENT as exc:
+                    limiter.settle(entry, 0)
+                    last_exc = exc
+                    delay = min(2 ** (attempt // pool.size), 20)
+                    if usage:
+                        usage.retries += 1
+                        usage.waited_seconds += delay
+                    if attempt < attempts - 1:
+                        sleep(delay)
+                    continue
+                except APIStatusError as exc:
+                    limiter.settle(entry, 0)
+                    if getattr(exc, "status_code", None) == 404:
+                        _dead_models.add(model)  # unknown model / no access: use the next one, now and later
+                        last_exc = exc
+                        break
+                    if getattr(exc, "status_code", None) == 413:
+                        err = _parse_too_large(exc)
+                        global learned_limit
+                        if err.limit:
+                            learned_limit = err.limit if learned_limit is None else min(learned_limit, err.limit)
+                        last_exc = err
+                        break  # a retry cannot help; try the fallback model if there is one
+                    raise
+            finally:
+                pool.release(idx)
             u = getattr(response, "usage", None)
             total = getattr(u, "total_tokens", None) if u else None
             limiter.settle(entry, total)

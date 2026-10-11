@@ -381,3 +381,12 @@ Each model has its own rate window and concurrency cap (`LLM_TPM`/`LLM_RPM` for 
 `LLM_TPM_SMALL`/`LLM_RPM_SMALL`/`LLM_CONCURRENCY_SMALL` for the others), so a burst of narration requests
 cannot starve the core model. 3Blue1Brown-style math, hand-written three.js and cartoon requests still use
 the free-form `write_source` workflow.
+
+### Multiple API keys
+
+Put extra Groq keys in `GROQ_API_KEYS` (comma or newline separated; `GROQ_API_KEY` stays the first). Calls are
+spread over the keys (least busy first), each key has its own rate window per model, and a key that gets a
+429 is skipped until its `Retry-After` expires; the request moves to another key immediately. Only when every
+key is cooling down does the agent wait. The job log shows "API key #2 is rate limited; switching to another
+key" and usage reports `key_switches`. Groq meters limits per organization, so keys must come from
+different Groq accounts to add real capacity.
