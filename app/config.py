@@ -19,9 +19,6 @@ PROJECT_ROOT = _project_root.resolve()
 HOST_PROJECT_ROOT = os.getenv("HOST_PROJECT_ROOT", "").strip()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-# More keys, comma or newline separated. Requests are spread over all keys and a rate-limited key is
-# skipped until it recovers. Groq meters per organization, so use keys from different accounts.
-GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEYS", "").replace("\n", ",").split(",") if k.strip()]
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
@@ -37,7 +34,7 @@ GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "").strip()
 # GROQ_SMALL_MODEL does the cheap, high-volume text work (narration scripts, repairs). On Groq the
 # token limits are per model, so splitting work across models multiplies the usable throughput.
 # Leave GROQ_SMALL_MODEL empty to send everything to the core model.
-GROQ_SMALL_MODEL = os.getenv("GROQ_SMALL_MODEL", "llama-3.1-8b-instant").strip()
+GROQ_SMALL_MODEL = os.getenv("GROQ_SMALL_MODEL", "qwen/qwen3.8-27b").strip()
 LLM_TPM_SMALL = int(os.getenv("LLM_TPM_SMALL", "0"))
 LLM_RPM_SMALL = int(os.getenv("LLM_RPM_SMALL", "0"))
 LLM_CONCURRENCY_SMALL = int(os.getenv("LLM_CONCURRENCY_SMALL", "4"))
