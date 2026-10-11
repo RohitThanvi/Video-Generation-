@@ -60,7 +60,7 @@ class TokenLimiter:
         while self._window and now - self._window[0][0] >= WINDOW_SECONDS:
             self._window.popleft()
 
-    def acquire(self, tokens: int):
+    def acquire(self, tokens: int, on_wait=None):
         """Reserve `tokens`; returns a handle for settle(). Sleeps (outside the lock) as needed."""
         while True:
             with self._lock:
@@ -74,6 +74,8 @@ class TokenLimiter:
                     self._window.append(entry)
                     return entry
                 wait = WINDOW_SECONDS - (now - self._window[0][0])
+            if on_wait and wait > 2:
+                on_wait(f"Waiting {round(wait)}s for the API token budget (LLM_TPM)…")
             self._sleep(max(wait, 0.05) + 0.05)
 
     def settle(self, entry, actual_tokens: int | None):
@@ -140,7 +142,7 @@ def get_limiter() -> TokenLimiter:
     return _limiter
 
 
-def complete(client, usage: Usage | None = None, sleep=time.sleep, **kwargs):
+def complete(client, usage: Usage | None = None, sleep=time.sleep, on_wait=None, **kwargs):
     """chat.completions.create with budgeting, retry and model fallback."""
     models = [kwargs.pop("model")]
     if config.GROQ_FALLBACK_MODEL and config.GROQ_FALLBACK_MODEL not in models:
@@ -149,7 +151,7 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, **kwargs):
     last_exc = None
     for model in models:
         for attempt in range(MAX_RETRIES):
-            entry = _limiter.acquire(estimate)
+            entry = _limiter.acquire(estimate, on_wait)
             try:
                 with _slots:
                     response = client.chat.completions.create(model=model, **kwargs)
@@ -164,6 +166,8 @@ def complete(client, usage: Usage | None = None, sleep=time.sleep, **kwargs):
                     usage.retries += 1
                     usage.waited_seconds += delay + 0.5
                 if attempt < MAX_RETRIES - 1:
+                    if on_wait:
+                        on_wait(f"Rate limited by the API; waiting {round(delay + 0.5)}s before retrying…")
                     sleep(delay + 0.5)
                 continue
             except _TRANSIENT as exc:

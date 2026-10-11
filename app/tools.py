@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import mimetypes
+import re
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -68,7 +69,18 @@ def _source_target(project_id: str, relative_path: str):
         raise ValueError("Path traversal is not allowed.")
     return root, target
 
+_PLACEHOLDER = re.compile(r"^\s*\[saved \d+ chars\]\s*$")
+
+def _reject_placeholder(content):
+    """History shows saved files as '[saved N chars]'; a model must never write that back as content."""
+    if isinstance(content, str) and _PLACEHOLDER.match(content):
+        raise ValueError(
+            "content is the '[saved N chars]' placeholder from the history, not real code. "
+            "Send the complete file content, or use read_source / patch_source to change the saved file."
+        )
+
 def write_source(project_id: str, relative_path: str, content: str):
+    _reject_placeholder(content)
     root, target = _source_target(project_id, relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
@@ -119,6 +131,7 @@ def install_design_kit(project_id: str):
     }
 
 def write_storyboard(project_id: str, storyboard: dict):
+    _reject_placeholder(storyboard)
     # Some models send the object as a JSON string.
     if isinstance(storyboard, str):
         try:
@@ -139,6 +152,7 @@ def write_storyboard(project_id: str, storyboard: dict):
     return {"path": "storyboard.json"}
 
 def save_text_asset(project_id: str, asset_type: str, filename: str, content: str):
+    _reject_placeholder(content)
     if asset_type == "narration":
         allowed = NARRATION_TEXT_EXTENSIONS
     elif asset_type in CATEGORY_EXTENSIONS:

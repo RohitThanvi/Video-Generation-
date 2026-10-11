@@ -1,9 +1,11 @@
 from openai import OpenAI
 import json
 import re
+import time
 from . import llm
-from .config import GROQ_API_KEY, GROQ_MODEL, LLM_TIMEOUT_SECONDS
+from .config import GROQ_API_KEY, GROQ_MODEL, LLM_TIMEOUT_SECONDS, AGENT_MAX_SECONDS
 from .project import project_dir, load_project, list_files
+from .validation import validate_project
 from .web_assets import search_free_images, download_asset
 from .tools import read_source, patch_source, generate_narrations, write_source, write_storyboard, save_text_asset, generate_narration, ingest_host_asset, validate, render, install_design_kit
 
@@ -25,6 +27,7 @@ inside the project workspace using ONLY the provided tools.
 - Libraries ALREADY INSTALLED in the renderer (never ask the user to upload them, never write them into source/, never download them): three.js (`import * as THREE from 'three'`, addons via 'three/addons/...'), gsap, d3, katex, and mathkit. Use them directly; the page's import map is added automatically. Do not use CDNs or a local three.min.js.
 - Files you saved appear in the history as "[saved N chars]" to save tokens; that is only elision. Always send real, complete content when you write. To change a saved file use patch_source (small fixes) or read_source then patch; do not rewrite the whole file for a small fix.
 - Several narration clips: call generate_narrations once with all of them instead of generate_narration repeatedly.
+- validate_project errors must be fixed; its warnings are optional polish (act on each at most once). As soon as validation has no errors, call render_video immediately; do not re-validate or rewrite files that already work.
 - Never stop to ask the user for a library or file, and never paste the code into your reply: always call write_source / write_storyboard / generate_narration / validate_project / render_video yourself and finish the video.
 - Audio inside the page is NOT recorded. Narration is made with generate_narration and attached to a scene in storyboard.json ("narration": "<file>.wav"); the compiler mixes it in.
 - The page is served over http inside the sandbox: relative fetch() of project files works, but prefer inlining small data.
@@ -414,6 +417,40 @@ def _shrink_history(messages: list, level: int) -> None:
 def _request_estimate(messages, tools) -> int:
     return llm.estimate_tokens(messages) + llm.estimate_tokens(tools)
 
+_MUTATING_TOOLS = {"write_source", "patch_source", "write_storyboard", "generate_narration", "generate_narrations", "save_text_asset", "install_design_kit"}
+
+def _finish_ourselves(project_id: str, emit, reason: str, usage, recent: list, final_message: str | None = None):
+    """The model is not converging (loop, time limit, forgot to render): complete the pipeline in code.
+
+    A renderable project is validated and rendered here; otherwise the error says exactly what is missing
+    and what the model did last, so the problem can be diagnosed instead of a bare 'maximum iterations'.
+    """
+    emit(f"Finishing the video automatically ({reason})…")
+    check = validate_project(project_id, require_renderable=True)
+    if not check["valid"] and final_message is not None:
+        # The model said it was finished but the project cannot render: report, do not raise.
+        return {
+            "status": "incomplete",
+            "message": final_message + "\n\nNote: the project is not renderable yet: " + "; ".join(check["errors"][:4]),
+            "usage": usage.as_dict(),
+        }
+    if not check["valid"]:
+        raise RuntimeError(
+            f"The agent stopped without a renderable project ({reason}). Problems: "
+            + "; ".join(check["errors"][:6])
+            + ". Last steps: " + " | ".join(recent[-8:])
+        )
+    from .project import load_project as _lp
+    settings = (_lp(project_id).get("settings") or {})
+    result = render(project_id, int(settings.get("width", 1920)), int(settings.get("height", 1080)),
+                    int(settings.get("fps", 30)), on_progress=emit)
+    return {
+        "status": "completed",
+        "message": f"The video was rendered automatically ({reason}). Check it and ask for changes if needed.",
+        "render": {k: result.get(k) for k in ("video_url", "size_bytes", "frames", "fps", "adjusted")},
+        "usage": usage.as_dict(),
+    }
+
 def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     """Drive the model until the video is built. `on_event(str)` receives live progress lines."""
     if not GROQ_API_KEY:
@@ -448,7 +485,13 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
     tools = _tool_schemas()
 
     shrink_level = 0
+    started = time.monotonic()
+    recent: list[str] = []          # last tool calls, for diagnostics
+    seen_calls: dict[str, int] = {}  # identical (tool, args) repeats
+    modified = rendered = False
     for turn in range(1, MAX_TURNS + 1):
+        if time.monotonic() - started > AGENT_MAX_SECONDS:
+            return _finish_ourselves(project_id, emit, f"time limit of {AGENT_MAX_SECONDS}s reached", usage, recent)
         emit(f"Thinking (step {turn})…")
         while True:
             # Stay under a request-size limit we already know about (413 from an earlier call).
@@ -463,6 +506,7 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                 response = llm.complete(
                     client,
                     usage=usage,
+                    on_wait=emit,
                     model=GROQ_MODEL,
                     messages=messages,
                     tools=tools,
@@ -502,6 +546,9 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
         messages.append(assistant)
 
         if not msg.tool_calls:
+            if modified and not rendered:
+                # It changed the project but never rendered (often claims it is done): do the render.
+                return _finish_ourselves(project_id, emit, "the model stopped before rendering", usage, recent, msg.content or "Agent completed.")
             return {"status": "completed", "message": msg.content or "Agent completed.", "usage": usage.as_dict()}
 
         for tc, call in zip(msg.tool_calls, assistant["tool_calls"]):
@@ -520,11 +567,25 @@ def run_agent(project_id: str, instruction: str | None = None, on_event=None):
                 tool_output = {"ok": False, "error": str(exc)}
                 emit(f"{tc.function.name} failed: {str(exc)[:160]}")
             _compact_call(call, args, tool_output["ok"])
+            name = tc.function.name
+            recent.append(f"{name}{'' if tool_output['ok'] else ' (failed)'}")
+            if tool_output["ok"] and name in _MUTATING_TOOLS:
+                modified, rendered = True, False
+            if tool_output["ok"] and name == "render_video":
+                rendered = True
+            content = _clip(json.dumps(tool_output, default=str))
+            # Same call + same arguments again and again = the model is stuck: say so, then stop it.
+            key = name + "|" + json.dumps(args, sort_keys=True, default=str)[:600]
+            seen_calls[key] = seen_calls.get(key, 0) + 1
+            if seen_calls[key] == 3:
+                content += ("\nNOTICE: you have made this exact call 3 times. Do something different "
+                            "(fix the cause of the error, change the arguments) or render_video now.")
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
+            if seen_calls[key] >= 5:
+                if rendered:
+                    return {"status": "completed", "message": "Done.", "usage": usage.as_dict()}
+                return _finish_ourselves(project_id, emit, f"the model repeated {name} without progress", usage, recent)
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": _clip(json.dumps(tool_output, default=str)),
-            })
-
-    raise RuntimeError("Agent reached the maximum tool-call iterations.")
+    if rendered:
+        return {"status": "completed", "message": "Done.", "usage": usage.as_dict()}
+    return _finish_ourselves(project_id, emit, f"the model used all {MAX_TURNS} steps", usage, recent)

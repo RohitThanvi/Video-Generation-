@@ -451,3 +451,86 @@ def test_streaming_runner_forwards_lines_and_enforces_failure(monkeypatch):
     monkeypatch.setattr(docker_runner, "SANDBOX_TIMEOUT_SECONDS", 1)
     with pytest.raises(sp.TimeoutExpired):
         docker_runner._run_streaming([sys.executable, "-c", "import time;time.sleep(30)"], lines.append)
+
+
+# ------------------------------------------------------------------ supervisor: never end in "max iterations"
+
+def _renderable_project(project):
+    from tests.conftest import make_renderable  # type: ignore
+
+    make_renderable(project)
+
+
+def _stub_render(monkeypatch, calls):
+    def fake(pid, w, h, fps, on_progress=None):
+        calls.append((w, h, fps))
+        return {"video_url": f"/projects/{pid}/video", "size_bytes": 5, "frames": 10, "fps": fps}
+
+    monkeypatch.setattr(agent, "render", fake)
+
+
+def test_model_that_loops_gets_the_video_finished_by_the_app(project, monkeypatch):
+    _renderable_project(project)
+    calls = []
+    _stub_render(monkeypatch, calls)
+    script = [_resp(calls=[_tc(f"c{i}", "validate_project", {})]) for i in range(10)]
+    _fake_llm(monkeypatch, script)
+    out = agent.run_agent(project, "go")
+    assert out["status"] == "completed" and "automatically" in out["message"] and calls == [(1920, 1080, 30)]
+
+
+def test_model_that_never_converges_hits_the_turn_limit_then_renders(project, monkeypatch):
+    _renderable_project(project)
+    calls = []
+    _stub_render(monkeypatch, calls)
+    monkeypatch.setattr(agent, "MAX_TURNS", 3)
+    script = [_resp(calls=[_tc(f"c{i}", "read_source", {"relative_path": f"f{i}.js"})]) for i in range(3)]
+    _fake_llm(monkeypatch, script)
+    out = agent.run_agent(project, "go")
+    assert "automatically" in out["message"] and calls
+
+
+def test_model_that_edits_then_stops_without_rendering_is_rendered(project, monkeypatch):
+    _renderable_project(project)
+    calls = []
+    _stub_render(monkeypatch, calls)
+    _fake_llm(monkeypatch, [
+        _resp(calls=[_tc("c1", "write_source", {"relative_path": "a.js", "content": "let a = 1;"})]),
+        _resp("All done, enjoy the video!"),
+    ])
+    out = agent.run_agent(project, "go")
+    assert calls and "automatically" in out["message"]
+
+
+def test_question_without_changes_is_not_rendered(project, monkeypatch):
+    calls = []
+    _stub_render(monkeypatch, calls)
+    _fake_llm(monkeypatch, [_resp("It is 8 seconds long.")])
+    assert agent.run_agent(project, "how long is it?")["message"] == "It is 8 seconds long."
+    assert calls == []
+
+
+def test_unrenderable_project_error_explains_what_is_missing(project, monkeypatch):
+    monkeypatch.setattr(agent, "MAX_TURNS", 2)
+    _fake_llm(monkeypatch, [_resp(calls=[_tc(f"c{i}", "read_source", {"relative_path": "x.js"})]) for i in range(2)])
+    with pytest.raises(RuntimeError, match="renderable|Last steps"):
+        agent.run_agent(project, "go")
+
+
+def test_time_limit_triggers_the_automatic_finish(project, monkeypatch):
+    _renderable_project(project)
+    calls = []
+    _stub_render(monkeypatch, calls)
+    monkeypatch.setattr(agent, "AGENT_MAX_SECONDS", -1)
+    _fake_llm(monkeypatch, [])
+    assert "time limit" in agent.run_agent(project, "go")["message"] and calls
+
+
+def test_history_placeholder_is_rejected_as_file_content(project):
+    for call in (
+        lambda: tools.write_source(project, "index.html", "[saved 9120 chars]"),
+        lambda: tools.write_storyboard(project, "[saved 300 chars]"),
+        lambda: tools.save_text_asset(project, "narration", "a.txt", "[saved 5 chars]"),
+    ):
+        with pytest.raises(ValueError, match="placeholder|JSON"):
+            call()

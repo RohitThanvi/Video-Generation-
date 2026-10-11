@@ -32,6 +32,10 @@ LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
 GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "").strip()
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 
+# Hard stop for one agent run (seconds). When it is hit, the app finishes the video itself
+# (validate + render) if the project is already renderable, instead of failing.
+AGENT_MAX_SECONDS = int(os.getenv("AGENT_MAX_SECONDS", "1500"))
+
 # Background jobs: how many agent/render jobs run at once, and how many renders (CPU-heavy).
 JOB_WORKERS = int(os.getenv("JOB_WORKERS", "3"))
 RENDER_CONCURRENCY = int(os.getenv("RENDER_CONCURRENCY", "1"))
