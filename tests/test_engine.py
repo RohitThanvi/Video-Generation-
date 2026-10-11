@@ -200,3 +200,21 @@ def test_invalid_tool_call_from_provider_is_fed_back_not_fatal(project, monkeypa
     out = agent.run_agent(project, "make a video about cats", on_event=events.append)
     assert out["message"] == "all good"
     assert "rejected" in seen[1]["content"] and any("invalid tool call" in e for e in events)
+
+
+def test_render_falls_back_when_sandbox_image_is_old(project, monkeypatch):
+    from app.docker_runner import DockerError
+    calls, msgs = [], []
+
+    def fake(pid, cmd, **kw):
+        calls.append(cmd)
+        if "--budget" in cmd:
+            raise DockerError("render.py: error: unrecognized arguments: --budget 1500")
+        (project_dir(pid) / "renders" / "final").mkdir(parents=True, exist_ok=True)
+        (project_dir(pid) / "renders" / "final" / "final.mp4").write_bytes(b"x")
+        return {"stdout": "", "stderr": ""}
+    monkeypatch.setattr(tools, "run_in_sandbox", fake)
+    engine.build_video(project, {"scenes": [{"id": "a", "headline": "One"}]}, narrate=False)
+    out = tools.render(project, 640, 360, 10, on_progress=msgs.append)
+    assert len(calls) == 2 and "--budget" not in calls[1] and out["video_url"]
+    assert any("out of date" in m for m in msgs)

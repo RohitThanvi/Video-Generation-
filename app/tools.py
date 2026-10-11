@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .config import MAX_FILE_BYTES, RENDER_CONCURRENCY, RENDER_BUDGET_SECONDS
 from .project import require_project_dir, load_project, save_project
 from .validation import validate_project, wav_seconds, min_scene_seconds
-from .docker_runner import run_in_sandbox
+from .docker_runner import DockerError, run_in_sandbox
 
 CATEGORY_DIRS = {
     "image": "assets/images",
@@ -310,21 +310,23 @@ def render(project_id: str, width: int, height: int, fps: int, on_progress=None)
     if not validation["valid"]:
         raise ValidationFailed(validation["errors"])
     root = require_project_dir(project_id)
+    base = ["python", "/opt/renderer/render.py", "--project", "/workspace",
+            "--width", str(width), "--height", str(height), "--fps", str(fps)]
+    extra = ({"on_line": lambda line: on_progress(line.split("progress:", 1)[1].strip())
+              if line.startswith("progress:") else None} if on_progress else {})
     with _RENDER_SLOTS:  # queue here when other renders are already using the CPU
-        result = run_in_sandbox(
-            project_id,
-            [
-                "python", "/opt/renderer/render.py",
-                "--project", "/workspace",
-                "--width", str(width),
-                "--height", str(height),
-                "--fps", str(fps),
-                "--budget", str(RENDER_BUDGET_SECONDS),
-            ],
-            output_name="renders/final/final.mp4",
-            **({"on_line": lambda line: on_progress(line.split("progress:", 1)[1].strip())
-                if on_progress and line.startswith("progress:") else None} if on_progress else {}),
-        )
+        try:
+            result = run_in_sandbox(project_id, base + ["--budget", str(RENDER_BUDGET_SECONDS)],
+                                    output_name="renders/final/final.mp4", **extra)
+        except DockerError as exc:
+            # A sandbox image built before the render-budget feature rejects --budget. Keep working
+            # (without the time budget) and say what to do, instead of failing every render.
+            if "unrecognized arguments" not in str(exc) or "--budget" not in str(exc):
+                raise
+            if on_progress:
+                on_progress("The sandbox image is out of date (no render time budget). Rendering anyway; "
+                            "rebuild it with: docker build -t ai-video-sandbox:latest ./sandbox")
+            result = run_in_sandbox(project_id, base, output_name="renders/final/final.mp4", **extra)
     video = root / "renders" / "final" / "final.mp4"
     if not video.is_file():
         raise RuntimeError("Render finished but renders/final/final.mp4 is missing.")
