@@ -29,10 +29,15 @@ def target_words(duration: float) -> int:
     return int(_clip(round((duration - 1.5) * 2.6), 14, 70))
 
 
+def wants_voice(sc: dict) -> bool:
+    """Character/animation (stage) scenes are silent unless the model gave them something to say."""
+    return sc["layout"] != "stage" or bool(sc["say"] or sc["narration"])
+
+
 def fallback_narration(sc: dict) -> str:
     """Deterministic spoken text when no model is available: the scene's own words."""
     text = sc["narration"] or sc["say"] or ""
-    if not text:
+    if not text and wants_voice(sc):
         bits = [sc["headline"], sc["body"]] + [i["title"] for i in sc.get("items", [])]
         text = ". ".join(b.rstrip(".") for b in bits if b)
     return " ".join(text.split())[:600]
@@ -119,7 +124,7 @@ def build_video(project_id: str, spec, write_narration=None, emit=None, narrate:
     seconds: dict[str, float] = {}
     if narrate:
         topic = spec["title"]
-        need = [s for s in scenes if not s["narration"]]
+        need = [s for s in scenes if not s["narration"] and wants_voice(s)]
         if need and write_narration:
             try:
                 written = write_narration([dict(id=s["id"], headline=s["headline"], say=s["say"], body=s["body"],
@@ -170,7 +175,7 @@ def build_video(project_id: str, spec, write_narration=None, emit=None, narrate:
     # 5. Page + the spec itself (so later edits are small patches, not rewrites).
     timing = {b["id"]: max(1.0, b["duration_seconds"] - 1.8) for b in board}  # silent scenes: pace reveals to the scene
     timing.update(seconds)
-    html = sc_mod.compile_html(spec, timing, image_for)
+    html = sc_mod.compile_html(spec, timing, image_for, durations={b["id"]: b["duration_seconds"] for b in board})
     page = root / "source" / "index.html"
     page.write_text(html, encoding="utf-8")
     (root / SPEC_PATH).write_text(json.dumps(spec, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -216,6 +221,8 @@ def patch_scene(project_id: str, scene_id: str, fields: dict | None = None, inse
             changed_words = any(k in fields and fields[k] != old.get(k) for k in ("headline", "say", "body", "narration"))
             if changed_words and "narration" not in fields:
                 old["narration"] = ""  # re-write the voice-over for the new content
+            if isinstance(fields.get("stage"), dict) and isinstance(old.get("stage"), dict):
+                fields["stage"] = {**old["stage"], **fields["stage"]}  # tweak the actor or the weather, keep the rest
             old.update(fields)
             if isinstance(fields.get("visual"), dict):
                 old["visual"] = fields["visual"]  # replace, do not merge stale chart data

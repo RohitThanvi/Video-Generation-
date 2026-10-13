@@ -43,6 +43,8 @@ a.add_argument("--name", default=None)
 e = sub.add_parser("example", help="create a project from examples/<name> (e.g. math-3b1b, three-3d, cartoon-explainer)")
 e.add_argument("name", nargs="?", default=None)
 
+d = sub.add_parser("stage-demo", help="build a showcase project of the stage layout (no model, no voice); then render it")
+
 args = parser.parse_args()
 
 if args.cmd == "create":
@@ -57,6 +59,25 @@ elif args.cmd == "show":
     print(json.dumps(load_project(args.project_id), indent=2))
 elif args.cmd == "add-asset":
     print(json.dumps(ingest_host_asset(args.project_id, args.asset_type, args.path, args.name), indent=2))
+elif args.cmd == "stage-demo":
+    from app import engine
+    look = {"shirt": "red", "pants": "navy", "hat": "party"}
+    spec = {"title": "Stage demo", "scenes": [
+        {"id": "pond", "layout": "stage", "headline": "A man dancing in a pond", "duration": 7,
+         "stage": {"env": "pond", "time": "sunset", "actors": [{"action": "dance", "style": "disco", "look": look}]}},
+        {"id": "walk", "layout": "stage", "headline": "Walking to the beach", "duration": 6,
+         "stage": {"env": "beach", "time": "day", "actors": [{"action": "walk", "from": 10, "to": 90, "look": {"shirt": "teal", "hair_style": "long", "glasses": True}}]}},
+        {"id": "robot", "layout": "stage", "headline": "Robot at the disco", "duration": 6,
+         "stage": {"env": "disco", "time": "night", "actors": [{"kind": "robot", "action": "dance", "style": "robot", "x": 35}, {"action": "dance", "style": "hiphop", "x": 68, "look": {"hair_style": "bun", "shirt": "purple"}}]}},
+        {"id": "city", "layout": "stage", "headline": "", "duration": 5,
+         "stage": {"env": "city", "time": "night", "actors": [{"action": "march", "from": 15, "to": 85}]}},
+        {"id": "space", "layout": "stage", "headline": "Jump!", "duration": 5,
+         "stage": {"env": "space", "time": "night", "actors": [{"kind": "robot", "action": "jump", "look": {"color": "gold", "accent": "lime"}}]}},
+        {"id": "forest", "layout": "stage", "headline": "Cheers", "duration": 5,
+         "stage": {"env": "forest", "time": "sunset", "actors": [{"action": "cheer", "look": {"hair_style": "long", "hair": "ginger"}}, {"action": "clap", "x": 70}]}},
+    ]}
+    pid = create_project("Stage demo")["id"]
+    print(json.dumps({"project_id": pid, **engine.build_video(pid, spec, narrate=False), "next": f"python scripts/cli.py render {pid}"}, indent=2))
 elif args.cmd == "example":
     available = sorted(d.name for d in EXAMPLES_DIR.iterdir() if (d / "storyboard.json").is_file()) if EXAMPLES_DIR.is_dir() else []
     if not args.name or args.name not in available:

@@ -9,7 +9,7 @@ Spec (all fields optional except scenes[].headline unless noted):
   "theme": "blue|sunset|emerald|crimson|gold|mono", "bg": "particles|network|stars|aurora|grid|waves|rain|none",
   "post": "vignette grain",
   "scenes": [{
-     "id": "intro", "layout": "title|split|stat|chart|list|steps|quote|photo|compare|custom",
+     "id": "intro", "layout": "title|split|stat|chart|list|steps|quote|photo|compare|stage|custom",
      "headline": "...", "kicker": "...", "body": "...", "say": "talking points for the narration",
      "narration": "exact spoken text (else written from `say`)", "duration": 6,
      "visual": {"type": "hero3d|bars|donut|line|photo|blob|icon|number|none", ...type fields},
@@ -17,6 +17,7 @@ Spec (all fields optional except scenes[].headline unless noted):
      "stat": {"value": 87, "prefix": "", "suffix": "%", "label": "..."},   # stat
      "quote": "...", "by": "...",                   # quote
      "left": {"title","items":[...]}, "right": {...},  # compare
+     "stage": {...},                                # stage: animated environment + character (see app/stage.py)
      "html": "<raw inner html>", "css": "...",      # custom (escape hatch, full creative freedom)
      "transition": "zoom|slide|wipe|curtain|slice|flip|blur|spin|rise|glitch", "kin": "rise|drop|blur|flip|wave|zoom|spin|glitch",
      "cam": "push|pull|left|right|drift|tilt|none"}]
@@ -25,9 +26,11 @@ Spec (all fields optional except scenes[].headline unless noted):
 import html as _html
 import re
 
+from . import stage as stage_mod
+
 THEMES = ("blue", "sunset", "emerald", "crimson", "gold", "mono")
 BGS = ("particles", "network", "stars", "aurora", "grid", "waves", "rain", "none")
-LAYOUTS = ("title", "split", "stat", "chart", "list", "steps", "quote", "photo", "compare", "custom")
+LAYOUTS = ("title", "split", "stat", "chart", "list", "steps", "quote", "photo", "compare", "stage", "custom")
 SHAPES = ("torusknot", "icosa", "globe", "crystal", "rings")
 VISUALS = ("hero3d", "bars", "donut", "line", "photo", "blob", "icon", "number", "none")
 TRANSITIONS = ("zoom", "slide", "wipe", "curtain", "slice", "flip", "blur", "spin", "rise", "glitch")
@@ -109,13 +112,13 @@ def normalize_spec(spec) -> dict:
             "transition": _pick(raw.get("transition"), TRANSITIONS),
             "kin": _pick(raw.get("kin"), KINS), "cam": _pick(raw.get("cam"), CAMS),
         }
-        if layout != "custom" and not sc["headline"] and layout != "quote":
+        if layout not in ("custom", "quote", "stage") and not sc["headline"]:
             raise ValueError(f"scenes[{i}] ({sid}) needs a headline.")
         vis = raw.get("visual") if isinstance(raw.get("visual"), dict) else {}
         vtype = _pick(vis.get("type"), VISUALS)
         if vtype is None:  # a scene without a hero visual is a slide: pick one by layout
             vtype = {"photo": "photo", "stat": "none", "list": "none", "steps": "none", "compare": "none",
-                     "quote": "blob", "chart": "bars", "custom": "none"}.get(layout, "hero3d" if i % 2 == 0 else "blob")
+                     "quote": "blob", "chart": "bars", "custom": "none", "stage": "none"}.get(layout, "hero3d" if i % 2 == 0 else "blob")
         if vtype == "hero3d":
             if heroes >= MAX_HEROES:
                 vtype = "blob"
@@ -151,6 +154,11 @@ def normalize_spec(spec) -> dict:
             for side in ("left", "right"):
                 d = raw.get(side) if isinstance(raw.get(side), dict) else {}
                 sc[side] = {"title": _text(d.get("title"), 40), "items": _items(d.get("items"), 4)}
+        if layout == "stage":
+            st = raw.get("stage")
+            if not isinstance(st, dict):  # tolerate a model that put env/actors straight on the scene
+                st = {k: raw[k] for k in ("env", "environment", "time", "actors", "props", "caption") if k in raw}
+            sc["stage"] = stage_mod.normalize_stage(st)
         if layout == "custom":
             sc["html"] = str(raw.get("html") or "")[:20000]
             sc["css"] = str(raw.get("css") or "")[:6000]
@@ -244,10 +252,16 @@ def _cards(items, clock, numbered=False) -> str:
     return f'<div class="{cols}">{"".join(cards)}</div>'
 
 
-def _scene_html(sc: dict, index: int, total: int, image_for, transition: str, clock: _Clock) -> str:
+def _scene_html(sc: dict, index: int, total: int, image_for, transition: str, clock: _Clock, duration: float | None = None) -> str:
     layout, v = sc["layout"], sc["visual"]
     side_text = lambda big=False: f'<div class="col grow">{_text_block(sc, clock, big)}</div>'
-    if layout == "custom":
+    if layout == "stage":
+        st = sc["stage"]
+        inner = stage_mod.render_stage(st, duration or sc["duration"], sc["id"])
+        if sc["headline"] and st["caption"]:
+            inner += f'<div class="st-cap fade-in-up" style="--d:.5s">{esc(sc["headline"])}</div>'
+        cls = "scene stage"
+    elif layout == "custom":
         inner = sc["html"]
         if sc["css"]:
             inner = f"<style>{sc['css']}</style>" + inner
@@ -293,24 +307,27 @@ def _scene_html(sc: dict, index: int, total: int, image_for, transition: str, cl
         parts = [side_text(), vis] if index % 2 == 0 else [vis, side_text()]
         inner = f'<div class="row">{"".join(p for p in parts if p)}</div>'
         cls = "scene"
-    attrs = f' data-transition="{transition}"' + (f' data-cam="{sc["cam"]}"' if sc["cam"] else "")
+    cam = "none" if layout == "stage" else sc["cam"]  # the stage has its own slow push-in
+    attrs = f' data-transition="{transition}"' + (f' data-cam="{cam}"' if cam else "")
     return f'<section class="{cls}" data-scene="{esc(sc["id"])}"{attrs}>{inner}</section>'
 
 
-def compile_html(spec: dict, narration_seconds: dict | None = None, image_for=None) -> str:
-    """spec must come from normalize_spec. narration_seconds: {scene id: seconds} to time the reveals."""
+def compile_html(spec: dict, narration_seconds: dict | None = None, image_for=None, durations: dict | None = None) -> str:
+    """spec must come from normalize_spec. narration_seconds: {scene id: seconds} to time the reveals.
+    durations: {scene id: final seconds}, so stage scenes can spread their movement over the whole scene."""
     narration_seconds = narration_seconds or {}
     sections, last = [], None
     for i, sc in enumerate(spec["scenes"]):
         trans = sc["transition"] or next(t for t in (TRANSITIONS[(i * 3 + 1) % len(TRANSITIONS)], "zoom", "blur") if t != last)
         last = trans
         clock = _Clock()
-        markup = _scene_html(sc, i, len(spec["scenes"]), image_for, trans, clock)
+        markup = _scene_html(sc, i, len(spec["scenes"]), image_for, trans, clock, (durations or {}).get(sc["id"]))
         sections.append(clock.resolve(markup, narration_seconds.get(sc["id"])))
+    stage_style = f"<style>{stage_mod.stage_css()}</style>" if any(sc["layout"] == "stage" for sc in spec["scenes"]) else ""
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         f'<title>{esc(spec["title"])}</title>'
-        '<link rel="stylesheet" href="kit.css"><link rel="stylesheet" href="fx.css"></head>\n'
+        f'<link rel="stylesheet" href="kit.css"><link rel="stylesheet" href="fx.css">{stage_style}</head>\n'
         f'<body data-theme="{spec["theme"]}" data-bg="{spec["bg"]}" data-post="{spec["post"]}">\n'
         '<div class="bg"><i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i></div>\n'
         + "\n".join(sections)

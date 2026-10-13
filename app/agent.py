@@ -113,10 +113,19 @@ To change something afterwards use patch_scene (one scene or the look), never re
  "scenes":[{"id":"intro","layout":"title","headline":"max 8 words","kicker":"short label","body":"one sentence (optional)",
    "say":"the talking points for the voice-over, 1-2 sentences of facts","visual":{...},"transition":"zoom","duration":6}]}
 Look: pick theme+bg from the topic (space=stars, tech/AI=network|rain, nature=aurora|waves, retro=grid, general=particles). Per-video, not per-scene.
-Layouts: title (opener/closer, centered), split (text + visual), chart (text + chart), stat (one giant counting number), list (3-6 cards with icons), steps (numbered cards), quote, compare (left/right with items), photo (text + big photo), custom (your own "html"+"css", only if no layout fits).
+Layouts: title (opener/closer, centered), split (text + visual), chart (text + chart), stat (one giant counting number), list (3-6 cards with icons), steps (numbered cards), quote, compare (left/right with items), photo (text + big photo), stage (animated world + character, see below), custom (your own "html"+"css", only if no layout fits).
 visual: {"type":"hero3d","shape":"torusknot|icosa|globe|crystal|rings"} (max 3 per video) | {"type":"bars","values":[..],"labels":[..],"suffix":"k"} | {"type":"line","values":[..]} | {"type":"donut","value":87,"suffix":"%","label":".."} | {"type":"photo","query":"search words"} (real free photo, downloaded for you) | {"type":"blob"} | {"type":"icon","name":"rocket"} | {"type":"number","value":1969,"label":".."}
 Other fields: list/steps -> "items":[{"title","text","icon"}]; stat -> "stat":{"value","prefix","suffix","label"}; quote -> "quote","by"; compare -> "left":{"title","items":[{"title"}]},"right":{..}; optional "kin" (rise|drop|blur|flip|wave|zoom|spin|glitch), "cam" (push|pull|left|right|drift|tilt|none), "transition" (zoom|slide|wipe|curtain|slice|flip|blur|spin|rise|glitch).
 Icons: rocket globe moon sun star zap clock check arrow chart users lightbulb target layers shield flag play satellite.
+
+## Characters and animation (layout "stage")
+Use "stage" for ANY request about a character, person, robot, mascot, cartoon, dance, or an "animation video of ...". It is a full-screen animated world with a rigged character; never use slide layouts for that.
+{"id":"s1","layout":"stage","headline":"optional short caption","duration":8,"stage":{"env":"pond|meadow|beach|city|space|disco|forest","time":"day|sunset|night",
+ "actors":[{"kind":"person|robot","action":"idle|wave|cheer|jump|walk|march|clap|dance","style":"disco|hiphop|robot|groove","x":50,"from":15,"to":85,"scale":1,"tempo":1,
+   "look":{"shirt":"red","pants":"navy","skin":"light|tan|brown|dark","hair":"brown","hair_style":"short|long|bun|none","hat":"none|cap|party|crown","glasses":false,"color":"silver","accent":"cyan"}}],
+ "props":["notes","sparkles","fish","butterflies","confetti","fireflies"]}}
+x is the position in % of the width; from/to make the actor travel across the scene (walk/march) while doing the action; style is only for dance; color/accent only for robots; up to 3 actors; props is optional (good ones are chosen if omitted). Fish live in pond/beach.
+Character videos: 4-6 stage scenes that tell a tiny story (arrive walking, wave, dance, jump or cheer at the end), changing env/time/action/look between scenes, and honouring the request literally (a man dancing in a pond = env pond, kind person, action dance, the look described). Stage scenes are silent unless the user wants a voice-over: then add "say".
 
 ## Craft rules
 - Open with the most striking scene, vary layouts (never 3 of the same in a row), end on a bold closing title. Use real numbers/facts from the topic in charts and stats.
@@ -135,13 +144,13 @@ _FX_SLIM = """
 ## Motion graphics (fx layer, loaded by the skeleton)
 Make it cinematic, never a slide deck. <body data-theme="blue|sunset|emerald|crimson|gold|mono" data-bg="particles|network|stars|aurora|grid|waves|rain" data-post="vignette grain">. Every scene gets a hero visual: <div class="hero3d" data-shape="torusknot|icosa|globe|crystal|rings" style="--size:640px"></div> (max 1 per scene), or <div class="fx-bars" data-values="1,2,3" data-labels="a,b,c">, <div class="fx-donut" data-value="80" data-suffix="%">, <div class="fx-line" data-values="1,3,2,5">, an inline SVG, or a big number. Headlines: data-split="chars|words" data-kin="rise|drop|blur|flip|wave|zoom|spin|glitch" (also .neon .fx-gradient). Camera moves are automatic; vary data-transition (zoom slide wipe curtain slice flip blur spin rise glitch). Ambient: .bob .breathe .spin-slow .glow .shine .blob .orbit.
 """
+# Character / cartoon / animation requests are NOT here: the scene engine's "stage" layout handles them.
 _OTHER_KEYWORDS = re.compile(
-    r"three\.?js|webgl|math|equation|calculus|theorem|proof|3blue|manim|vector|derivative|integral|"
-    r"cartoon|character|squash|mascot|animated explainer|svg animation", re.IGNORECASE)
+    r"three\.?js|webgl|math|equation|calculus|theorem|proof|3blue|manim|vector|derivative|integral", re.IGNORECASE)
 
 def build_system(user_text: str = "", slim: bool = False) -> str:
-    """Engine prompt (small, ~1k tokens) for ordinary videos. 3D / math / cartoon requests keep the
-    hand-written-page prompt, since those styles are not compiled by the scene engine."""
+    """Engine prompt (small, ~1.4k tokens) for ordinary videos and character/animation videos (stage layout).
+    Hand-written three.js / math requests keep the hand-written-page prompt."""
     if _OTHER_KEYWORDS.search(user_text or ""):
         return _CORE + (_FX_SLIM if slim else _FX_FULL) + (_OTHER if not slim else "")
     return _ENGINE
