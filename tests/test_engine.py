@@ -79,7 +79,7 @@ def test_build_video_pipeline(project, fake_sandbox, monkeypatch, writer):
     out = engine.build_video(project, SPEC, write_narration=writer)
     root = project_dir(project)
     assert out["scenes"] == 8 and len(out["narrated"]) == 8 and writer.calls == [[s for s in out["narrated"]]] or len(writer.calls) == 1
-    page = (root / "source" / "index.html").read_text()
+    page = (root / "source" / "index.html").read_text(encoding="utf-8")
     assert "../assets/images/pic.jpg" in page
     board = json.loads((root / "storyboard.json").read_text())["scenes"]
     assert all(b["duration_seconds"] >= 6.5 and b["narration"].endswith(".wav") for b in board)

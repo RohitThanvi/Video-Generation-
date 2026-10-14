@@ -101,9 +101,9 @@ def test_stage_scenes_are_silent_unless_asked(project, monkeypatch):
         POND, dict(POND, id="talk", say="He dances because the water is warm"), {"id": "end", "headline": "The end"}]},
         write_narration=lambda items: asked.append([i["id"] for i in items]) or {i["id"]: "Words." for i in items})
     assert asked == [["talk", "end"]] and sorted(seen) == ["end.wav", "talk.wav"]
-    board = {b["id"]: b for b in json.loads((project_dir(project) / "storyboard.json").read_text())["scenes"]}
+    board = {b["id"]: b for b in json.loads((project_dir(project) / "storyboard.json").read_text(encoding="utf-8"))["scenes"]}
     assert "narration" not in board["pond"] and board["pond"]["duration_seconds"] == 8
-    page = (project_dir(project) / "source" / "index.html").read_text()
+    page = (project_dir(project) / "source" / "index.html").read_text(encoding="utf-8")
     assert "--dur:8s" in page and out["layouts"][0] == "stage"
 
 

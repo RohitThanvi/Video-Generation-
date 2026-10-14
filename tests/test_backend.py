@@ -282,7 +282,10 @@ def test_unknown_project_is_404_everywhere(client):
     assert client.get("/projects/not-an-id/video").status_code == 404
 
 
-def test_request_bodies_are_optional(client, project):
+def test_request_bodies_are_optional(client, project, monkeypatch):
+    from app import agent
+    monkeypatch.setattr(agent, "GROQ_API_KEY", "")  # a key in the developer's .env must not change this test
+    monkeypatch.setattr(agent, "GROQ_API_KEYS", [])
     r = client.post(f"/projects/{project}/render")
     assert r.status_code == 422 and "validation failed" in r.json()["detail"].lower()
     r = client.post(f"/projects/{project}/agent")
