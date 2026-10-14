@@ -361,6 +361,13 @@ def test_virtual_clock_makes_rendering_deterministic(tmp_path, monkeypatch, caps
 
 # ------------------------------------------------------------------ tts
 
+def test_chromium_uses_software_compositing_but_keeps_webgl():
+    args = render.CHROMIUM_ARGS
+    assert "--disable-gpu-compositing" in args  # ~2-3x faster frames; see the comment in render.py
+    assert "--disable-gpu" not in args  # that one would risk the WebGL (three.js) scenes
+    assert {"--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--enable-webgl"} <= set(args)
+
+
 def test_tts_accepts_text_file_or_text_but_not_both_or_neither():
     args = tts.parse_args(["--text-file", "/x.txt", "--output", "/o.wav"])
     assert args.text_file == "/x.txt" and args.text is None

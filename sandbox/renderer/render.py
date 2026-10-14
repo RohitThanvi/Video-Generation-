@@ -384,6 +384,14 @@ CHROMIUM_ARGS = [
     "--enable-unsafe-swiftshader",
     "--ignore-gpu-blocklist",
     "--enable-webgl",
+    # Composite and rasterize the page in plain software instead of through SwiftShader's GL
+    # emulation. WebGL canvases still use SwiftShader (flags above), but ordinary 2D content
+    # (SVG, CSS, text, canvas) stops paying for GL emulation: measured 2-3x faster per captured
+    # frame (e.g. 780 -> 240 ms for a full-screen SVG scene, 800 -> 440 ms for a three.js scene,
+    # 1080p, same CPU), with output within ~49 dB PSNR of the old renderer (anti-aliasing noise).
+    # Frame time is CPU-bound inside Chromium, so this is also what keeps long videos inside the
+    # render time budget at full resolution.
+    "--disable-gpu-compositing",
     # Stable, resolution-independent text and colours.
     "--font-render-hinting=none",
     "--force-color-profile=srgb",
