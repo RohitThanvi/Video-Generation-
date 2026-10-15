@@ -113,7 +113,7 @@ To change something afterwards use patch_scene (one scene or the look), never re
  "scenes":[{"id":"intro","layout":"title","headline":"max 8 words","kicker":"short label","body":"one sentence (optional)",
    "say":"the talking points for the voice-over, 1-2 sentences of facts","visual":{...},"transition":"zoom","duration":6}]}
 Look: pick theme+bg from the topic (space=stars, tech/AI=network|rain, nature=aurora|waves, retro=grid, general=particles). Per-video, not per-scene.
-Layouts: title (opener/closer, centered), split (text + visual), chart (text + chart), stat (one giant counting number), list (3-6 cards with icons), steps (numbered cards), quote, compare (left/right with items), photo (text + big photo), stage (animated world + character, see below), custom (your own "html"+"css", only if no layout fits).
+Layouts: title (opener/closer, centered), split (text + visual), chart (text + chart), stat (one giant counting number), list (3-6 cards with icons), steps (numbered cards), quote, compare (left/right with items), photo (text + big photo), stage (animated world + character, see below), flow / orbit / timeline / kinetic (motion graphics, see below), custom (your own "html"+"css", only if no layout fits).
 visual: {"type":"hero3d","shape":"torusknot|icosa|globe|crystal|rings"} (max 3 per video) | {"type":"bars","values":[..],"labels":[..],"suffix":"k"} | {"type":"line","values":[..]} | {"type":"donut","value":87,"suffix":"%","label":".."} | {"type":"photo","query":"search words"} (real free photo, downloaded for you) | {"type":"blob"} | {"type":"icon","name":"rocket"} | {"type":"number","value":1969,"label":".."}
 Other fields: list/steps -> "items":[{"title","text","icon"}]; stat -> "stat":{"value","prefix","suffix","label"}; quote -> "quote","by"; compare -> "left":{"title","items":[{"title"}]},"right":{..}; optional "kin" (rise|drop|blur|flip|wave|zoom|spin|glitch), "cam" (push|pull|left|right|drift|tilt|none), "transition" (zoom|slide|wipe|curtain|slice|flip|blur|spin|rise|glitch).
 Icons: rocket globe moon sun star zap clock check arrow chart users lightbulb target layers shield flag play satellite.
@@ -126,6 +126,14 @@ Use "stage" for ANY request about a character, person, robot, mascot, cartoon, d
  "props":["notes","sparkles","fish","butterflies","confetti","fireflies"]}}
 x is the position in % of the width; from/to make the actor travel across the scene (walk/march) while doing the action; style is only for dance; color/accent only for robots; up to 3 actors; props is optional (good ones are chosen if omitted). Fish live in pond/beach.
 Character videos: 4-6 stage scenes that tell a tiny story (arrive walking, wave, dance, jump or cheer at the end), changing env/time/action/look between scenes, and honouring the request literally (a man dancing in a pond = env pond, kind person, action dance, the look described). Stage scenes are silent unless the user wants a voice-over: then add "say".
+
+## Motion graphics (layouts flow, orbit, timeline, kinetic)
+These are truly animated scenes (connectors draw themselves, packets travel, satellites orbit, a comet runs along a timeline, shapes pulse). PREFER THEM over list/steps/compare, which read as slides.
+- flow: how something works / a pipeline / a loop. {"layout":"flow","headline":"..","shape":"line|cycle|hub","items":[{"title":"max 40 chars","text":"optional","icon":"rocket"}],"edges":[[0,1],[1,2]]} 2-7 items; edges optional (default: chain for line, closed ring for cycle, centre fan-out for hub, where item 0 is the hub).
+- orbit: an ecosystem / parts around a core. {"layout":"orbit","headline":"..","center":{"title":"Core","icon":"star"},"items":[{"title":"..","icon":".."}]} 2-8 items.
+- timeline: history / roadmap. {"layout":"timeline","headline":"..","items":[{"label":"1969","title":"ARPANET","text":"first packets"}]} 2-6 items.
+- kinetic: a hook, punchline or big statement over moving shapes. {"layout":"kinetic","headline":"..","lines":["up to 4 short lines"]} no visual needed.
+Rules: at least 2/3 of the scenes must be stage, flow, orbit, timeline, kinetic or a hero3d scene; open with kinetic, stage or hero3d; use plain list/steps/compare at most once per video; use flow for processes, orbit for systems, timeline for history, kinetic for hooks and the closing line.
 
 ## Craft rules
 - Open with the most striking scene, vary layouts (never 3 of the same in a row), end on a bold closing title. Use real numbers/facts from the topic in charts and stats.

@@ -9,7 +9,7 @@ Spec (all fields optional except scenes[].headline unless noted):
   "theme": "blue|sunset|emerald|crimson|gold|mono", "bg": "particles|network|stars|aurora|grid|waves|rain|none",
   "post": "vignette grain",
   "scenes": [{
-     "id": "intro", "layout": "title|split|stat|chart|list|steps|quote|photo|compare|stage|custom",
+     "id": "intro", "layout": "title|split|stat|chart|list|steps|quote|photo|compare|flow|orbit|timeline|kinetic|stage|custom",
      "headline": "...", "kicker": "...", "body": "...", "say": "talking points for the narration",
      "narration": "exact spoken text (else written from `say`)", "duration": 6,
      "visual": {"type": "hero3d|bars|donut|line|photo|blob|icon|number|none", ...type fields},
@@ -18,6 +18,7 @@ Spec (all fields optional except scenes[].headline unless noted):
      "quote": "...", "by": "...",                   # quote
      "left": {"title","items":[...]}, "right": {...},  # compare
      "stage": {...},                                # stage: animated environment + character (see app/stage.py)
+     "items": [...], "edges": [[0,1]], "shape": "line|cycle|hub", "center": {...}, "lines": [...]   # flow / orbit / timeline / kinetic (app/motion.py)
      "html": "<raw inner html>", "css": "...",      # custom (escape hatch, full creative freedom)
      "transition": "zoom|slide|wipe|curtain|slice|flip|blur|spin|rise|glitch", "kin": "rise|drop|blur|flip|wave|zoom|spin|glitch",
      "cam": "push|pull|left|right|drift|tilt|none"}]
@@ -26,11 +27,12 @@ Spec (all fields optional except scenes[].headline unless noted):
 import html as _html
 import re
 
+from . import motion as motion_mod
 from . import stage as stage_mod
 
 THEMES = ("blue", "sunset", "emerald", "crimson", "gold", "mono")
 BGS = ("particles", "network", "stars", "aurora", "grid", "waves", "rain", "none")
-LAYOUTS = ("title", "split", "stat", "chart", "list", "steps", "quote", "photo", "compare", "stage", "custom")
+LAYOUTS = ("title", "split", "stat", "chart", "list", "steps", "quote", "photo", "compare", "flow", "orbit", "timeline", "kinetic", "stage", "custom")
 SHAPES = ("torusknot", "icosa", "globe", "crystal", "rings")
 VISUALS = ("hero3d", "bars", "donut", "line", "photo", "blob", "icon", "number", "none")
 TRANSITIONS = ("zoom", "slide", "wipe", "curtain", "slice", "flip", "blur", "spin", "rise", "glitch")
@@ -118,7 +120,8 @@ def normalize_spec(spec) -> dict:
         vtype = _pick(vis.get("type"), VISUALS)
         if vtype is None:  # a scene without a hero visual is a slide: pick one by layout
             vtype = {"photo": "photo", "stat": "none", "list": "none", "steps": "none", "compare": "none",
-                     "quote": "blob", "chart": "bars", "custom": "none", "stage": "none"}.get(layout, "hero3d" if i % 2 == 0 else "blob")
+                     "quote": "blob", "chart": "bars", "custom": "none", "stage": "none",
+                     "flow": "none", "orbit": "none", "timeline": "none", "kinetic": "none"}.get(layout, "hero3d" if i % 2 == 0 else "blob")
         if vtype == "hero3d":
             if heroes >= MAX_HEROES:
                 vtype = "blob"
@@ -154,6 +157,8 @@ def normalize_spec(spec) -> dict:
             for side in ("left", "right"):
                 d = raw.get(side) if isinstance(raw.get(side), dict) else {}
                 sc[side] = {"title": _text(d.get("title"), 40), "items": _items(d.get("items"), 4)}
+        if layout in motion_mod.LAYOUTS:
+            sc["motion"] = motion_mod.normalize_motion(layout, dict(raw, headline=sc["headline"]), ICONS)
         if layout == "stage":
             st = raw.get("stage")
             if not isinstance(st, dict):  # tolerate a model that put env/actors straight on the scene
@@ -261,6 +266,10 @@ def _scene_html(sc: dict, index: int, total: int, image_for, transition: str, cl
         if sc["headline"] and st["caption"]:
             inner += f'<div class="st-cap fade-in-up" style="--d:.5s">{esc(sc["headline"])}</div>'
         cls = "scene stage"
+    elif layout in motion_mod.LAYOUTS:
+        kin = sc["kin"] or KINS[sum(map(ord, sc["id"])) % len(KINS)]
+        inner = motion_mod.render_motion(sc, clock, _text_block(sc, clock, layout == "kinetic"), kin)
+        cls = "scene motion"
     elif layout == "custom":
         inner = sc["html"]
         if sc["css"]:
@@ -323,7 +332,9 @@ def compile_html(spec: dict, narration_seconds: dict | None = None, image_for=No
         clock = _Clock()
         markup = _scene_html(sc, i, len(spec["scenes"]), image_for, trans, clock, (durations or {}).get(sc["id"]))
         sections.append(clock.resolve(markup, narration_seconds.get(sc["id"])))
-    stage_style = f"<style>{stage_mod.stage_css()}</style>" if any(sc["layout"] == "stage" for sc in spec["scenes"]) else ""
+    used = {sc["layout"] for sc in spec["scenes"]}
+    stage_style = (f"<style>{stage_mod.stage_css()}</style>" if "stage" in used else "") + \
+                  (f"<style>{motion_mod.motion_css()}</style>" if used & set(motion_mod.LAYOUTS) else "")
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         f'<title>{esc(spec["title"])}</title>'
